@@ -232,6 +232,17 @@ def send_no_signal_ping():
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
+    send_telegram([{
+    "asset": "TEST",
+    "signal": "UP",
+    "price": 1.2345,
+    "sma50": 1.2300,
+    "adx": 30,
+    "rsi": 65,
+    "confidence": 99,
+    "time_ist": ist_now(),
+             }])
+
     
     print(f"[{ist_now()}] Scanner starting...")
 
