@@ -18,8 +18,8 @@ def ist_now() -> str:
     return datetime.now(IST).strftime("%d %b %Y  %I:%M %p IST")
 
 # ── Config from GitHub Secrets ────────────────────────────────────────────────
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]   # set in GitHub Secrets
-CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]     # your chat/group/channel id
+BOT_TOKEN = "8754354364:AAEVl7JUG9TT-Qg7E32dacUhGtJyjQ7khoI"  # set in GitHub Secrets
+CHAT_ID   = "8754354364"    # your chat/group/channel id
 
 # ── Assets ────────────────────────────────────────────────────────────────────
 ASSETS = {
