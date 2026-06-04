@@ -199,8 +199,8 @@ def send_telegram(signals: list[dict]):
 
     lines += [
         "",
-        "⚠️ <i>Paper trading only. Always verify before live money.</i>",
-        f"🤖 <i>Auto-scan by SMA-50 Engine</i>",
+        "⚠️ <i>Binary trading only. Always verify before live money.</i>",
+        f"🤖 <i>Auto-scan by Crypto Knight</i>",
     ]
 
     text = "\n".join(lines)
@@ -232,16 +232,7 @@ def send_no_signal_ping():
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    send_telegram([{
-    "asset": "TEST",
-    "signal": "UP",
-    "price": 1.2345,
-    "sma50": 1.2300,
-    "adx": 30,
-    "rsi": 65,
-    "confidence": 99,
-    "time_ist": ist_now(),
-          }])
+    
     print(f"[{ist_now()}] Scanner starting...")
 
     active, reason = is_market_active()
