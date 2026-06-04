@@ -211,6 +211,8 @@ def send_telegram(signals: list[dict]):
         "text":       text,
         "parse_mode": "HTML",
     }, timeout=15)
+    print("Status Code:", resp.status_code)
+    print("Response Body:", resp.text)
     resp.raise_for_status()
     print(f"✅ Sent {len(signals)} signal(s) to Telegram")
 
