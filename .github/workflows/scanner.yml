@@ -1,6 +1,7 @@
 name: SMA-50 Signal Scanner
 
 on:
+  push:
   schedule:
     # Runs every 5 minutes — GitHub Actions minimum is 5 min
     # Times are UTC. Indian market hours = UTC 03:30–10:00 (NSE)
