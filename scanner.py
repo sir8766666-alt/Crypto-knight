@@ -19,7 +19,7 @@ def ist_now() -> str:
 
 # ── Config from GitHub Secrets ────────────────────────────────────────────────
 BOT_TOKEN = "8754354364:AAEVl7JUG9TT-Qg7E32dacUhGtJyjQ7khoI"  # set in GitHub Secrets
-CHAT_ID   = "8754354364"    # your chat/group/channel id
+CHAT_ID   = "8185149536"    # your chat/group/channel id
 
 # ── Assets ────────────────────────────────────────────────────────────────────
 ASSETS = {
