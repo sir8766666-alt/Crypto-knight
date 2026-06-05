@@ -1,8 +1,6 @@
 name: SMA-50 Signal Scanner
 
 on:
-  schedule:
-    - cron: '*/5 * * * *'
   workflow_dispatch:
 
 env:
@@ -12,7 +10,7 @@ jobs:
   scan:
     name: Run Scanner
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    timeout-minutes: 35
 
     steps:
       - name: Checkout Repository
