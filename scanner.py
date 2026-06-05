@@ -92,8 +92,8 @@ def analyze(name, ticker):
     candles_up   = float(r["close"]) > float(p2["close"]) > float(p3["close"])
     candles_down = float(r["close"]) < float(p2["close"]) < float(p3["close"])
 
-    if adx_val < 25: return None
-    if 42 < rsi_val < 58: return None
+    if adx_val < 22: return None
+    if 44 < rsi_val < 56: return None
 
     bull = (price > sma50 and sma_slope > 0
             and ema9_val > ema21_val
@@ -114,7 +114,7 @@ def analyze(name, ticker):
     conf += 8 if (candles_up or candles_down) else 0
     conf  = min(conf, 98)
 
-    if conf < 90: return None
+    if conf < 80: return None
 
     return {
         "asset": name, "signal": signal,
@@ -185,7 +185,7 @@ def send_no_signal():
                     f"🔍 <b>Crypto Knight</b>\n\n"
                     f"❌ <b>No trades this scan</b>\n"
                     f"⏰ <code>{ist_now()}</code>\n\n"
-                    f"<i>No asset hit 90%+ confidence.\n"
+                    f"<i>No asset hit 80%+ confidence.\n"
                     f"Try again at:\n"
                     f"• 09:15 IST — London open\n"
                     f"• 13:45 IST — London/NY overlap\n"
