@@ -34,12 +34,7 @@ ASSETS = {
     "AUD/USD": "AUDUSD=X",
     "EUR/JPY": "EURJPY=X",
     "AUD/CAD": "AUDCAD=X",
-    "AUD/CAD OTC": "AUDCAD=X",
-    "AUD/CHF OTC": "AUDCHF=X",
-    "EUR/USD OTC": "EURUSD=X",
-    "GBP/USD OTC": "GBPUSD=X",
-    "USD/JPY OTC": "JPY=X",
-    "EUR/JPY OTC": "EURJPY=X",
+    
 }
 
 # ── Indicators ────────────────────────────────────────────────────────────────
