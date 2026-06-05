@@ -193,7 +193,7 @@ def send_session_start(scan_end_ist):
                     f"⏰ Started  : <code>{ist_now()}</code>\n"
                     f"⏳ Scanning : <code>30 minutes</code>\n"
                     f"🔍 Strategy : <code>SMA-50 + ADX + RSI</code>\n"
-                    f"🎯 Min conf : <code>90%</code>\n"
+                    f"🎯 Min conf : <code>{MIN_CONFIDENCE}</code>\n"
                     f"⏱️ Expiry   : <code>5 minutes</code>\n"
                     f"📊 Max trades: <code>3</code>\n\n"
                     f"<i>Will alert you instantly when signal found.\nSession ends {scan_end_ist} IST or after 3 trades.</i>"
