@@ -1,27 +1,33 @@
 """
-Autonomous SMA-50 Signal Scanner
-Runs via GitHub Actions every 5 minutes — no server needed
-Sends Telegram alerts ONLY for high-confidence UP/DOWN signals
+SMA-50 Signal Scanner v3 — GitHub Actions, every 5 min
+Internal 60s loop covers each minute. Signals point to NEXT candle.
+Secrets come from GitHub Actions env — NEVER hardcode tokens.
 """
 
-import os
-import httpx
-import yfinance as yf
-import pandas as pd
-import numpy as np
+import os, time, httpx, yfinance as yf, pandas as pd, numpy as np
 from datetime import datetime, timezone, timedelta
 
-# ── Indian Standard Time (UTC+5:30) ──────────────────────────────────────────
 IST = timezone(timedelta(hours=5, minutes=30))
 
-def ist_now() -> str:
-    return datetime.now(IST).strftime("%d %b %Y  %I:%M %p IST")
+def ist_now(dt=None):
+    d = dt or datetime.now(IST)
+    return d.strftime("%d %b %Y  %I:%M %p IST")
 
-# ── Config from GitHub Secrets ────────────────────────────────────────────────
-BOT_TOKEN = "8754354364:AAEVl7JUG9TT-Qg7E32dacUhGtJyjQ7khoI"# set in GitHub Secrets
-CHAT_ID   =   "8185149536" # your chat/group/channel id
+def next_candle_time():
+    now = datetime.now(IST)
+    nxt = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    return nxt.strftime("%I:%M %p IST")
 
-# ── Assets ────────────────────────────────────────────────────────────────────
+# ── Read from GitHub Secrets — will raise clear error if missing ──────────────
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID")
+
+if not BOT_TOKEN or not CHAT_ID:
+    raise EnvironmentError(
+        "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set in GitHub Secrets.\n"
+        "Go to: Repo → Settings → Secrets and variables → Actions → New repository secret"
+    )
+
 ASSETS = {
     "EUR/USD": "EURUSD=X",
     "GBP/USD": "GBPUSD=X",
@@ -31,71 +37,43 @@ ASSETS = {
     "USD/JPY": "JPY=X",
 }
 
-# ── Market session check — avoid dead hours ───────────────────────────────────
-def is_market_active() -> tuple[bool, str]:
-    """
-    Forex/Commodities: 24/5 (Mon-Fri).
-    Crypto: always.
-    Skip scanning 00:00–06:00 IST on weekdays (thin liquidity).
-    Skip weekends entirely for forex.
-    Returns (active, reason).
-    """
-    now_ist = datetime.now(IST)
-    weekday = now_ist.weekday()   # 0=Mon … 6=Sun
-    hour    = now_ist.hour
+sent_this_run: set = set()
 
-    if weekday == 5:   # Saturday
-        return False, "Weekend — forex markets closed"
-    if weekday == 6 and hour < 19:  # Sunday before ~19:30 IST (Sydney open)
-        return False, "Weekend — markets not yet open"
-    if 0 <= hour < 6:
-        return False, "Dead hours 00:00–06:00 IST — thin liquidity, skipping"
-    return True, "Market active"
+# ── Market hours filter ───────────────────────────────────────────────────────
+def is_market_active():
+    now  = datetime.now(IST)
+    wday = now.weekday()
+    hour = now.hour
+    if wday == 5: return False, "Saturday — forex closed"
+    if wday == 6 and hour < 19: return False, "Sunday — not open yet"
+    if 0 <= hour < 6: return False, "00:00–06:00 IST dead hours"
+    return True, "ok"
 
 # ── Indicators ────────────────────────────────────────────────────────────────
-def compute_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    high, low, close = df["high"], df["low"], df["close"]
-    plus_dm  = high.diff().clip(lower=0)
-    minus_dm = (-low.diff()).clip(lower=0)
-    plus_dm[plus_dm   <= minus_dm] = 0
-    minus_dm[minus_dm <= plus_dm]  = 0
-    tr = pd.concat([
-        high - low,
-        (high - close.shift()).abs(),
-        (low  - close.shift()).abs()
-    ], axis=1).max(axis=1)
-    atr      = tr.ewm(span=period, adjust=False).mean()
-    plus_di  = 100 * plus_dm.ewm(span=period,  adjust=False).mean() / atr
-    minus_di = 100 * minus_dm.ewm(span=period, adjust=False).mean() / atr
-    dx       = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-    return dx.ewm(span=period, adjust=False).mean()
+def calc_adx(df, p=14):
+    h, l, c = df["high"], df["low"], df["close"]
+    pdm = h.diff().clip(lower=0)
+    mdm = (-l.diff()).clip(lower=0)
+    pdm[pdm <= mdm] = 0
+    mdm[mdm <= pdm] = 0
+    tr  = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
+    atr = tr.ewm(span=p, adjust=False).mean()
+    pdi = 100 * pdm.ewm(span=p, adjust=False).mean() / atr
+    mdi = 100 * mdm.ewm(span=p, adjust=False).mean() / atr
+    dx  = 100 * (pdi-mdi).abs() / (pdi+mdi).replace(0, np.nan)
+    return dx.ewm(span=p, adjust=False).mean()
 
-def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain  = delta.clip(lower=0).ewm(span=period, adjust=False).mean()
-    loss  = (-delta.clip(upper=0)).ewm(span=period, adjust=False).mean()
-    rs    = gain / loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
+def calc_rsi(s, p=14):
+    d = s.diff()
+    g = d.clip(lower=0).ewm(span=p, adjust=False).mean()
+    l = (-d.clip(upper=0)).ewm(span=p, adjust=False).mean()
+    return 100 - (100 / (1 + g / l.replace(0, np.nan)))
 
-def compute_ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
+def calc_ema(s, p):
+    return s.ewm(span=p, adjust=False).mean()
 
-# ── Core analysis ─────────────────────────────────────────────────────────────
-def analyze(name: str, ticker: str) -> dict | None:
-    """
-    Returns signal dict if tradeable, None if sideways/neutral.
-
-    Strategy (WIN-FOCUSED):
-      - Sideways filter : ADX < 22  → skip
-      - Trend filter    : price side of SMA-50
-      - Momentum filter : EMA-9 vs EMA-21 (fast trend confirm)
-      - Strength filter : RSI not in 45–55 dead zone
-      - Candle confirm  : last close stronger than previous close
-
-    Confidence built from:
-      ADX strength + RSI extremity + EMA separation + candle momentum
-    Only fires signal if confidence >= 65 (reduces noise trades)
-    """
+# ── Analysis ──────────────────────────────────────────────────────────────────
+def analyze(name, ticker):
     try:
         df = yf.download(ticker, period="3d", interval="1m",
                          progress=False, auto_adjust=True)
@@ -103,170 +81,149 @@ def analyze(name: str, ticker: str) -> dict | None:
             return None
         df.columns = [c[0].lower() if isinstance(c, tuple) else c.lower()
                       for c in df.columns]
-    except Exception:
+    except Exception as e:
+        print(f"    fetch error: {e}")
         return None
 
     df["sma50"] = df["close"].rolling(50).mean()
-    df["ema9"]  = compute_ema(df["close"], 9)
-    df["ema21"] = compute_ema(df["close"], 21)
-    df["adx"]   = compute_adx(df)
-    df["rsi"]   = compute_rsi(df["close"])
+    df["ema9"]  = calc_ema(df["close"], 9)
+    df["ema21"] = calc_ema(df["close"], 21)
+    df["adx"]   = calc_adx(df)
+    df["rsi"]   = calc_rsi(df["close"])
 
-    r = df.iloc[-1]   # latest bar
-    p = df.iloc[-2]   # previous bar
+    r, prev = df.iloc[-1], df.iloc[-2]
+    price     = float(r["close"])
+    sma50     = float(r["sma50"])
+    adx_val   = float(r["adx"])
+    rsi_val   = float(r["rsi"])
+    sma_slope = float(r["sma50"]) - float(prev["sma50"])
+    candle_up = float(r["close"]) > float(prev["close"])
+    ema9_val  = float(r["ema9"])
+    ema21_val = float(r["ema21"])
 
-    price    = float(r["close"])
-    sma50    = float(r["sma50"])
-    ema9     = float(r["ema9"])
-    ema21    = float(r["ema21"])
-    adx_val  = float(r["adx"])
-    rsi_val  = float(r["rsi"])
-    sma_slope = float(r["sma50"]) - float(p["sma50"])
-    candle_up = float(r["close"]) > float(p["close"])
+    if adx_val < 22: return None
+    if 44 < rsi_val < 56: return None
 
-    # ── Hard filters ──────────────────────────────────────────────────────────
-    if adx_val < 22:                        # no trend
-        return None
-    if 44 < rsi_val < 56:                   # RSI in dead zone
-        return None
-
-    # ── Signal detection ──────────────────────────────────────────────────────
     bull = (price > sma50 and sma_slope > 0
-            and ema9 > ema21 and rsi_val > 56 and candle_up)
-
+            and ema9_val > ema21_val and rsi_val > 56 and candle_up)
     bear = (price < sma50 and sma_slope < 0
-            and ema9 < ema21 and rsi_val < 44 and not candle_up)
+            and ema9_val < ema21_val and rsi_val < 44 and not candle_up)
 
     if not bull and not bear:
         return None
 
     signal = "UP" if bull else "DOWN"
+    conf   = 50
+    conf  += min(20, int((adx_val - 22) * 0.9))
+    conf  += min(15, int(abs(rsi_val - 50) * 0.5))
+    conf  += min(10, int(abs(ema9_val - ema21_val) / price * 20000))
+    conf   = min(conf, 95)
+    if conf < 65: return None
 
-    # ── Confidence score ──────────────────────────────────────────────────────
-    conf = 50
-    conf += min(20, int((adx_val - 22) * 0.9))     # trend strength
-    rsi_ext = abs(rsi_val - 50)
-    conf += min(15, int(rsi_ext * 0.5))             # RSI extremity
-    ema_sep = abs(ema9 - ema21) / price * 10000
-    conf += min(10, int(ema_sep * 2))               # EMA separation
-    conf  = min(conf, 95)
-
-    if conf < 65:                                    # not worth trading
-        return None
-
-    decimals = 2 if "BTC" in name else 5
-
+    dec = 2 if "BTC" in name else 5
     return {
-        "asset":     name,
-        "signal":    signal,
-        "price":     round(price, decimals),
-        "sma50":     round(sma50, decimals),
-        "adx":       round(adx_val, 1),
-        "rsi":       round(rsi_val, 1),
-        "confidence":conf,
-        "time_ist":  ist_now(),
+        "asset": name, "signal": signal,
+        "price": round(price, dec), "sma50": round(sma50, dec),
+        "adx": round(adx_val, 1), "rsi": round(rsi_val, 1),
+        "confidence": conf,
     }
 
-# ── Telegram sender ───────────────────────────────────────────────────────────
-def send_telegram(signals: list[dict]):
+# ── Telegram ──────────────────────────────────────────────────────────────────
+def send_signals(signals):
     if not signals:
         return
+    trade_at = next_candle_time()
+    scan_at  = ist_now()
 
-    lines = ["<b>🎯 SMA-50 SIGNAL ALERT</b>", ""]
-
-    for s in signals:
-        if s["signal"] == "UP":
-            emoji  = "🟢"
-            action = "CALL ▲"
-            advice = "Place a <b>CALL (UP)</b> trade"
-        else:
-            emoji  = "🔴"
-            action = "PUT ▼"
-            advice = "Place a <b>PUT (DOWN)</b> trade"
-
-        lines += [
-            f"{emoji} <b>{s['asset']}</b>  —  <b>{action}</b>",
-            f"💰 Price       : <code>{s['price']}</code>",
-            f"📈 SMA-50      : <code>{s['sma50']}</code>",
-            f"⚡ ADX         : <code>{s['adx']}</code>",
-            f"📊 RSI         : <code>{s['rsi']}</code>",
-            f"🎯 Confidence  : <code>{s['confidence']}%</code>",
-            f"⏰ Time (IST)  : <code>{s['time_ist']}</code>",
-            f"⏱️ Expiry       : <b>1 MINUTE</b>",
-            f"📌 Action      : {advice}",
-            "──────────────────────",
-        ]
-
-    lines += [
-        "",
-        "⚠️ <i>Binary trading only. Always verify before live money.</i>",
-        f"🤖 <i>Auto-scan by Crypto Knight</i>",
+    lines = [
+        "🎯 <b>SMA-50 SIGNAL — Crypto Knight</b>", "",
+        f"⏰ <b>Scanned at   :</b> <code>{scan_at}</code>",
+        f"🕐 <b>Trade candle :</b> <code>{trade_at}</code>  ← open trade here",
+        f"⏱️ <b>Expiry       :</b> <code>1 MINUTE</code>",
+        "──────────────────────", "",
     ]
+    for s in signals:
+        em, act = ("🟢", "CALL  ▲  (UP)") if s["signal"] == "UP" else ("🔴", "PUT   ▼  (DOWN)")
+        lines += [
+            f"{em} <b>{s['asset']}</b>",
+            f"   Signal     : <b>{act}</b>",
+            f"   Price      : <code>{s['price']}</code>",
+            f"   SMA-50     : <code>{s['sma50']}</code>",
+            f"   ADX        : <code>{s['adx']}</code>",
+            f"   RSI        : <code>{s['rsi']}</code>",
+            f"   Confidence : <code>{s['confidence']}%</code>",
+            "",
+        ]
+    lines += ["──────────────────────", "⚠️ <i>Paper trading only.</i>"]
 
-    text = "\n".join(lines)
+    r = httpx.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        json={"chat_id": CHAT_ID, "text": "\n".join(lines), "parse_mode": "HTML"},
+        timeout=15,
+    )
+    print(f"  Telegram: {r.status_code}")
+    r.raise_for_status()
+    print(f"  ✅ Sent {len(signals)} signal(s)")
 
-    url  = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    resp = httpx.post(url, json={
-        "chat_id":    CHAT_ID,
-        "text":       text,
-        "parse_mode": "HTML",
-    }, timeout=15)
-    print("Status Code:", resp.status_code)
-    print("Response Body:", resp.text)
-    resp.raise_for_status()
-    print(f"✅ Sent {len(signals)} signal(s) to Telegram")
-
-
-def send_no_signal_ping():
-    """Sends a quiet status ping every hour so you know the bot is alive."""
-    now = datetime.now(IST)
-    if now.minute > 5:   # only send near the top of the hour
+def heartbeat_if_needed():
+    if datetime.now(IST).minute > 4:
         return
-    url  = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    httpx.post(url, json={
-        "chat_id":    CHAT_ID,
-        "text":       f"🔍 <b>SMA-50 Scanner</b> — No signal this scan\n⏰ <code>{ist_now()}</code>\n<i>Markets active, watching all 6 pairs...</i>",
-        "parse_mode": "HTML",
-    }, timeout=15)
+    httpx.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        json={
+            "chat_id": CHAT_ID,
+            "text": f"🤖 <b>Crypto Knight Scanner</b> — alive\n⏰ <code>{ist_now()}</code>\n<i>Watching 6 pairs every 60s</i>",
+            "parse_mode": "HTML",
+        },
+        timeout=15,
+    )
 
-
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Main loop — 4 scans × 60s inside one GitHub Actions job ──────────────────
 def main():
-    send_telegram([{
-    "asset": "TEST",
-    "signal": "UP",
-    "price": 1.2345,
-    "sma50": 1.2300,
-    "adx": 30,
-    "rsi": 65,
-    "confidence": 99,
-    "time_ist": ist_now(),
-             }])
-
-    
-    print(f"[{ist_now()}] Scanner starting...")
+    print(f"[{ist_now()}] Job started")
 
     active, reason = is_market_active()
     if not active:
-        print(f"⏸  Skipping: {reason}")
+        print(f"⏸  {reason} — exiting")
         return
 
-    signals = []
-    for name, ticker in ASSETS.items():
-        print(f"  Analyzing {name}...")
-        result = analyze(name, ticker)
-        if result:
-            print(f"  → {result['signal']} | conf={result['confidence']}%")
-            signals.append(result)
-        else:
-            print(f"  → No signal")
+    JOB_DURATION  = 4 * 60   # 4 minutes
+    SCAN_INTERVAL = 60
+    job_start     = time.time()
+    iteration     = 0
 
-    if signals:
-        send_telegram(signals)
-    else:
-        print("No tradeable signals this scan.")
-        send_no_signal_ping()
+    while time.time() - job_start < JOB_DURATION:
+        iteration += 1
+        scan_start = time.time()
+        print(f"\n── Scan #{iteration}  [{ist_now()}] ──")
+
+        signals = []
+        for name, ticker in ASSETS.items():
+            key = f"{name}-{datetime.now(IST).strftime('%H:%M')}"
+            if key in sent_this_run:
+                print(f"  {name}: already sent this minute")
+                continue
+            result = analyze(name, ticker)
+            if result:
+                print(f"  {name}: {result['signal']} conf={result['confidence']}%")
+                signals.append(result)
+                sent_this_run.add(key)
+            else:
+                print(f"  {name}: no signal")
+
+        send_signals(signals)
+        heartbeat_if_needed()
+
+        elapsed   = time.time() - scan_start
+        sleep_for = max(0, SCAN_INTERVAL - elapsed)
+        remaining = JOB_DURATION - (time.time() - job_start)
+        if remaining <= sleep_for + 5:
+            break
+        print(f"  Sleeping {sleep_for:.0f}s...")
+        time.sleep(sleep_for)
+
+    print(f"\n[{ist_now()}] Done — {iteration} scans")
 
 if __name__ == "__main__":
     main()
-
+    
