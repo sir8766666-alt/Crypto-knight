@@ -10,19 +10,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone, timedelta
-from fastapi import FastAPI
-from scanner import main
 
-app = FastAPI()
-
-@app.get("/")
-def health():
-    return {"status": "ok"}
-
-@app.get("/scan")
-def scan():
-    main()
-    return {"status": "completed"}
 # ── Indian Standard Time (UTC+5:30) ──────────────────────────────────────────
 IST = timezone(timedelta(hours=5, minutes=30))
 
