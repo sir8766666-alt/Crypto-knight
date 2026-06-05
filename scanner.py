@@ -1,7 +1,10 @@
 """
-SMA-50 Signal Scanner v3 — GitHub Actions, every 5 min
-Internal 60s loop covers each minute. Signals point to NEXT candle.
-Secrets come from GitHub Actions env — NEVER hardcode tokens.
+SMA-50 Manual Session Scanner — Crypto Knight
+Triggered manually via GitHub Actions workflow_dispatch.
+- Scans every 5 min for up to 30 min
+- Only fires signals with confidence >= 90%
+- Stops after 3 trades sent
+- 5-min expiry — enough time to open app and place trade
 """
 
 import os, time, httpx, yfinance as yf, pandas as pd, numpy as np
@@ -13,46 +16,31 @@ def ist_now(dt=None):
     d = dt or datetime.now(IST)
     return d.strftime("%d %b %Y  %I:%M %p IST")
 
-def next_candle_time():
+def trade_candle_time():
+    """5-min expiry — tells trader exactly when candle closes."""
     now = datetime.now(IST)
     nxt = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
-    return nxt.strftime("%I:%M %p IST")
+    exp = nxt + timedelta(minutes=5)
+    return nxt.strftime("%I:%M %p"), exp.strftime("%I:%M %p")
 
-# ── Read from GitHub Secrets — will raise clear error if missing ──────────────
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID")
 
 if not BOT_TOKEN or not CHAT_ID:
-    raise EnvironmentError(
-        "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set in GitHub Secrets.\n"
-        "Go to: Repo → Settings → Secrets and variables → Actions → New repository secret"
-    )
+    raise EnvironmentError("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in GitHub Secrets")
 
 ASSETS = {
-    "EUR/USD": "EURUSD=X",   # confirmed on Pocket Option
-    "USD/JPY": "JPY=X",      # confirmed on Pocket Option
-    "AUD/USD": "AUDUSD=X",   # confirmed on Pocket Option
-    "EUR/JPY": "EURJPY=X",   # confirmed on Pocket Option
-    "AUD/CAD": "AUDCAD=X",   # confirmed on Pocket Option
-    "WTI/OIL": "CL=F",       # WTI Crude Oil — same price as OTC on Pocket Option
+    "EUR/USD": "EURUSD=X",
+    "USD/JPY": "JPY=X",
+    "AUD/USD": "AUDUSD=X",
+    "EUR/JPY": "EURJPY=X",
+    "AUD/CAD": "AUDCAD=X",
+    "WTI/OIL": "CL=F",
 }
 
-sent_this_run: set = set()
-
-# ── Market hours filter ───────────────────────────────────────────────────────
 OIL_ASSETS = {"WTI/OIL"}
 
-def is_market_active():
-    now  = datetime.now(IST)
-    wday = now.weekday()
-    hour = now.hour
-    if wday == 5: return False, "Saturday — forex closed"
-    if wday == 6 and hour < 19: return False, "Sunday — not open yet"
-    if 0 <= hour < 6: return False, "00:00–06:00 IST dead hours"
-    return True, "ok"
-
 def is_asset_active(name):
-    """WTI futures close 01:00-02:30 IST daily — skip that window."""
     now  = datetime.now(IST)
     hour, minu = now.hour, now.minute
     if name in OIL_ASSETS and hour == 1: return False
@@ -66,30 +54,29 @@ def calc_adx(df, p=14):
     mdm = (-l.diff()).clip(lower=0)
     pdm[pdm <= mdm] = 0
     mdm[mdm <= pdm] = 0
-    tr  = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
-    atr = tr.ewm(span=p, adjust=False).mean()
-    pdi = 100 * pdm.ewm(span=p, adjust=False).mean() / atr
-    mdi = 100 * mdm.ewm(span=p, adjust=False).mean() / atr
-    dx  = 100 * (pdi-mdi).abs() / (pdi+mdi).replace(0, np.nan)
-    return dx.ewm(span=p, adjust=False).mean()
+    tr  = pd.concat([h-l,(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(axis=1)
+    atr = tr.ewm(span=p,adjust=False).mean()
+    pdi = 100*pdm.ewm(span=p,adjust=False).mean()/atr
+    mdi = 100*mdm.ewm(span=p,adjust=False).mean()/atr
+    dx  = 100*(pdi-mdi).abs()/(pdi+mdi).replace(0,np.nan)
+    return dx.ewm(span=p,adjust=False).mean()
 
 def calc_rsi(s, p=14):
     d = s.diff()
-    g = d.clip(lower=0).ewm(span=p, adjust=False).mean()
-    l = (-d.clip(upper=0)).ewm(span=p, adjust=False).mean()
-    return 100 - (100 / (1 + g / l.replace(0, np.nan)))
+    g = d.clip(lower=0).ewm(span=p,adjust=False).mean()
+    l = (-d.clip(upper=0)).ewm(span=p,adjust=False).mean()
+    return 100-(100/(1+g/l.replace(0,np.nan)))
 
 def calc_ema(s, p):
-    return s.ewm(span=p, adjust=False).mean()
+    return s.ewm(span=p,adjust=False).mean()
 
-# ── Analysis ──────────────────────────────────────────────────────────────────
+# ── Analysis — 90%+ confidence only ──────────────────────────────────────────
 def analyze(name, ticker):
     try:
         df = yf.download(ticker, period="3d", interval="1m",
                          progress=False, auto_adjust=True)
-        if df.empty or len(df) < 60:
-            return None
-        df.columns = [c[0].lower() if isinstance(c, tuple) else c.lower()
+        if df.empty or len(df) < 60: return None
+        df.columns = [c[0].lower() if isinstance(c,tuple) else c.lower()
                       for c in df.columns]
     except Exception as e:
         print(f"    fetch error: {e}")
@@ -101,153 +88,209 @@ def analyze(name, ticker):
     df["adx"]   = calc_adx(df)
     df["rsi"]   = calc_rsi(df["close"])
 
-    r, prev = df.iloc[-1], df.iloc[-2]
+    # Use last 3 candles for stronger confirmation
+    r, p2, p3 = df.iloc[-1], df.iloc[-2], df.iloc[-3]
+
     price     = float(r["close"])
     sma50     = float(r["sma50"])
     adx_val   = float(r["adx"])
     rsi_val   = float(r["rsi"])
-    sma_slope = float(r["sma50"]) - float(prev["sma50"])
-    candle_up = float(r["close"]) > float(prev["close"])
     ema9_val  = float(r["ema9"])
     ema21_val = float(r["ema21"])
+    sma_slope = float(r["sma50"]) - float(p2["sma50"])
 
-    if adx_val < 22: return None
-    if 44 < rsi_val < 56: return None
+    # Consecutive candles in same direction (stronger signal)
+    candles_up   = float(r["close"]) > float(p2["close"]) > float(p3["close"])
+    candles_down = float(r["close"]) < float(p2["close"]) < float(p3["close"])
+
+    # ── Very strict filters for 90%+ confidence ───────────────────────────────
+    if adx_val < 25: return None          # stronger trend required
+    if 42 < rsi_val < 58: return None     # tighter dead zone
 
     bull = (price > sma50 and sma_slope > 0
-            and ema9_val > ema21_val and rsi_val > 56 and candle_up)
-    bear = (price < sma50 and sma_slope < 0
-            and ema9_val < ema21_val and rsi_val < 44 and not candle_up)
+            and ema9_val > ema21_val
+            and rsi_val > 58 and candles_up)
 
-    if not bull and not bear:
-        return None
+    bear = (price < sma50 and sma_slope < 0
+            and ema9_val < ema21_val
+            and rsi_val < 42 and candles_down)
+
+    if not bull and not bear: return None
 
     signal = "UP" if bull else "DOWN"
-    conf   = 50
-    conf  += min(20, int((adx_val - 22) * 0.9))
-    conf  += min(15, int(abs(rsi_val - 50) * 0.5))
-    conf  += min(10, int(abs(ema9_val - ema21_val) / price * 20000))
-    conf   = min(conf, 95)
-    if conf < 65: return None
+
+    # ── Confidence — needs all components strong to hit 90 ───────────────────
+    conf = 50
+    conf += min(22, int((adx_val - 25) * 1.1))       # ADX above 25
+    conf += min(18, int(abs(rsi_val - 50) * 0.6))     # RSI extremity
+    conf += min(12, int(abs(ema9_val-ema21_val)/price*25000))  # EMA gap
+    conf += 8 if candles_up or candles_down else 0     # 3-candle streak bonus
+    conf  = min(conf, 98)
+
+    if conf < 90: return None             # hard cutoff — 90% minimum
 
     dec = 2 if "BTC" in name else 5
     return {
         "asset": name, "signal": signal,
-        "price": round(price, dec), "sma50": round(sma50, dec),
-        "adx": round(adx_val, 1), "rsi": round(rsi_val, 1),
+        "price": round(price, dec),
+        "sma50": round(sma50, dec),
+        "adx":   round(adx_val, 1),
+        "rsi":   round(rsi_val, 1),
         "confidence": conf,
     }
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
-def send_signals(signals):
-    if not signals:
-        return
-    trade_at = next_candle_time()
-    scan_at  = ist_now()
+def send_signal(s, trade_num, total_allowed):
+    open_at, close_at = trade_candle_time()
+    em, act = ("🟢","CALL  ▲  (UP)") if s["signal"]=="UP" else ("🔴","PUT   ▼  (DOWN)")
 
     lines = [
-        "🎯 <b>SMA-50 SIGNAL — Crypto Knight</b>", "",
-        f"⏰ <b>Scanned at   :</b> <code>{scan_at}</code>",
-        f"🕐 <b>Trade candle :</b> <code>{trade_at}</code>  ← open trade here",
-        f"⏱️ <b>Expiry       :</b> <code>1 MINUTE</code>",
-        "──────────────────────", "",
+        f"🎯 <b>TRADE {trade_num}/{total_allowed} — Crypto Knight</b>",
+        "",
+        f"{em} <b>{s['asset']}  —  {act}</b>",
+        "",
+        f"💰 Price      : <code>{s['price']}</code>",
+        f"📈 SMA-50     : <code>{s['sma50']}</code>",
+        f"⚡ ADX        : <code>{s['adx']}</code>",
+        f"📊 RSI        : <code>{s['rsi']}</code>",
+        f"🎯 Confidence : <code>{s['confidence']}%</code>",
+        "",
+        f"⏰ Open trade : <code>{open_at} IST</code>",
+        f"⏱️ Close at   : <code>{close_at} IST</code>  (5-min expiry)",
+        f"🕐 Scanned    : <code>{ist_now()}</code>",
+        "",
+        "──────────────────────",
+        f"📌 <b>Open Pocket Option NOW → select {s['asset']} → place {act.split()[0]}</b>",
+        "──────────────────────",
+        "⚠️ <i>Paper trading. Max 3 trades this session.</i>",
     ]
-    for s in signals:
-        em, act = ("🟢", "CALL  ▲  (UP)") if s["signal"] == "UP" else ("🔴", "PUT   ▼  (DOWN)")
-        lines += [
-            f"{em} <b>{s['asset']}</b>",
-            f"   Signal     : <b>{act}</b>",
-            f"   Price      : <code>{s['price']}</code>",
-            f"   SMA-50     : <code>{s['sma50']}</code>",
-            f"   ADX        : <code>{s['adx']}</code>",
-            f"   RSI        : <code>{s['rsi']}</code>",
-            f"   Confidence : <code>{s['confidence']}%</code>",
-            "",
-        ]
-    lines += ["──────────────────────", "⚠️ <i>Paper trading only.</i>"]
 
     try:
         r = httpx.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": "\n".join(lines), "parse_mode": "HTML"},
+            json={"chat_id":CHAT_ID,"text":"\n".join(lines),"parse_mode":"HTML"},
             timeout=15,
         )
         print(f"  Telegram: {r.status_code}")
         if r.status_code == 403:
-            print("  ❌ 403 Forbidden — bot not started or wrong Chat ID")
-            print("  👉 Open this in browser to find your real Chat ID:")
-            print(f"     https://api.telegram.org/bot{BOT_TOKEN}/getUpdates")
-            print("  👉 Then send /start to your bot and try again")
-            return
+            print("  ❌ 403 — check Chat ID and that you started the bot")
+            return False
         r.raise_for_status()
-        print(f"  ✅ Sent {len(signals)} signal(s)")
-    except httpx.HTTPStatusError as e:
-        print(f"  ❌ Telegram error: {e} — scanner continues")
+        print(f"  ✅ Signal sent: {s['asset']} {s['signal']} {s['confidence']}%")
+        return True
     except Exception as e:
-        print(f"  ❌ Network error: {e} — scanner continues")
+        print(f"  ❌ Telegram error: {e}")
+        return False
 
-def heartbeat_if_needed():
-    if datetime.now(IST).minute > 4:
-        return
-    httpx.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        json={
-            "chat_id": CHAT_ID,
-            "text": f"🤖 <b>Crypto Knight Scanner</b> — alive\n⏰ <code>{ist_now()}</code>\n<i>Watching 6 pairs every 60s</i>",
-            "parse_mode": "HTML",
-        },
-        timeout=15,
+def send_session_start(scan_end_ist):
+    try:
+        httpx.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id": CHAT_ID,
+                "text": (
+                    f"🚀 <b>Crypto Knight — Session Started</b>\n\n"
+                    f"⏰ Started  : <code>{ist_now()}</code>\n"
+                    f"⏳ Scanning : <code>30 minutes</code>\n"
+                    f"🔍 Strategy : <code>SMA-50 + ADX + RSI</code>\n"
+                    f"🎯 Min conf : <code>90%</code>\n"
+                    f"⏱️ Expiry   : <code>5 minutes</code>\n"
+                    f"📊 Max trades: <code>3</code>\n\n"
+                    f"<i>Will alert you instantly when signal found.\nSession ends {scan_end_ist} IST or after 3 trades.</i>"
+                ),
+                "parse_mode": "HTML",
+            },
+            timeout=15,
+        )
+    except Exception as e:
+        print(f"  Session start ping failed: {e}")
+
+def send_session_end(trades_sent):
+    msg = (
+        f"🏁 <b>Session Complete — Crypto Knight</b>\n\n"
+        f"📊 Trades sent : <code>{trades_sent}/3</code>\n"
+        f"⏰ Ended at    : <code>{ist_now()}</code>\n\n"
     )
+    if trades_sent == 0:
+        msg += "<i>No 90%+ signals found this session.\nTry during 09:00–11:00 or 13:30–15:30 IST for best results.</i>"
+    elif trades_sent < 3:
+        msg += f"<i>Only {trades_sent} high-confidence signal(s) found.\nQuality over quantity — good discipline.</i>"
+    else:
+        msg += "<i>3 trades placed. Step away and let them close.\nDo NOT place more trades.</i>"
 
-# ── Main loop — 4 scans × 60s inside one GitHub Actions job ──────────────────
+    try:
+        httpx.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id":CHAT_ID,"text":msg,"parse_mode":"HTML"},
+            timeout=15,
+        )
+    except Exception as e:
+        print(f"  Session end ping failed: {e}")
+
+# ── Main — 30 min session, scan every 5 min, max 3 trades ────────────────────
 def main():
-    print(f"[{ist_now()}] Job started")
+    SESSION_DURATION = 30 * 60    # 30 minutes
+    SCAN_INTERVAL    = 5  * 60    # scan every 5 minutes
+    MAX_TRADES       = 3
+    MIN_CONFIDENCE   = 90
 
-    active, reason = is_market_active()
-    if not active:
-        print(f"⏸  {reason} — exiting")
-        return
+    job_start   = time.time()
+    trades_sent = 0
+    scan_count  = 0
+    sent_assets = set()           # don't double-signal same asset
 
-    JOB_DURATION  = 4 * 60   # 4 minutes
-    SCAN_INTERVAL = 60
-    job_start     = time.time()
-    iteration     = 0
+    session_end_ist = (datetime.now(IST) + timedelta(minutes=30)).strftime("%I:%M %p")
+    print(f"[{ist_now()}] Session started — max {MAX_TRADES} trades, {MIN_CONFIDENCE}%+ confidence")
 
-    while time.time() - job_start < JOB_DURATION:
-        iteration += 1
-        scan_start = time.time()
-        print(f"\n── Scan #{iteration}  [{ist_now()}] ──")
+    send_session_start(session_end_ist)
 
-        signals = []
+    while True:
+        elapsed = time.time() - job_start
+
+        if trades_sent >= MAX_TRADES:
+            print(f"\n✅ {MAX_TRADES} trades sent — session complete")
+            break
+        if elapsed >= SESSION_DURATION:
+            print(f"\n⏰ 30 min session ended")
+            break
+
+        scan_count += 1
+        print(f"\n── Scan #{scan_count}  [{ist_now()}]  trades={trades_sent}/{MAX_TRADES} ──")
+
         for name, ticker in ASSETS.items():
-            key = f"{name}-{datetime.now(IST).strftime('%H:%M')}"
-            if key in sent_this_run:
-                print(f"  {name}: already sent this minute")
+            if trades_sent >= MAX_TRADES:
+                break
+            if name in sent_assets:
                 continue
             if not is_asset_active(name):
-                print(f"  {name}: market closed right now")
+                print(f"  {name}: market closed")
                 continue
+
             result = analyze(name, ticker)
             if result:
-                print(f"  {name}: {result['signal']} conf={result['confidence']}%")
-                signals.append(result)
-                sent_this_run.add(key)
+                print(f"  {name}: {result['signal']} conf={result['confidence']}% ← SIGNAL!")
+                ok = send_signal(result, trades_sent+1, MAX_TRADES)
+                if ok:
+                    trades_sent += 1
+                    sent_assets.add(name)
             else:
                 print(f"  {name}: no signal")
 
-        send_signals(signals)
-        heartbeat_if_needed()
-
-        elapsed   = time.time() - scan_start
-        sleep_for = max(0, SCAN_INTERVAL - elapsed)
-        remaining = JOB_DURATION - (time.time() - job_start)
-        if remaining <= sleep_for + 5:
+        if trades_sent >= MAX_TRADES:
             break
-        print(f"  Sleeping {sleep_for:.0f}s...")
+
+        # Sleep until next 5-min scan
+        scan_elapsed = time.time() - job_start
+        remaining    = SESSION_DURATION - scan_elapsed
+        sleep_for    = min(SCAN_INTERVAL, remaining)
+        if sleep_for <= 10:
+            break
+        print(f"\n  ⏳ Next scan in {int(sleep_for/60)}m {int(sleep_for%60)}s  |  {trades_sent}/{MAX_TRADES} trades  |  {int(remaining/60)}m left in session")
         time.sleep(sleep_for)
 
-    print(f"\n[{ist_now()}] Done — {iteration} scans")
+    send_session_end(trades_sent)
+    print(f"\n[{ist_now()}] Done — {trades_sent} trades, {scan_count} scans")
 
 if __name__ == "__main__":
     main()
-    
+            
