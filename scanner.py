@@ -229,10 +229,10 @@ def send_session_end(trades_sent):
 
 # ── Main — 30 min session, scan every 5 min, max 3 trades ────────────────────
 def main():
-    SESSION_DURATION = 30 * 60    # 30 minutes
+    SESSION_DURATION = 15 * 60    # 15 minutes
     SCAN_INTERVAL    = 5  * 60    # scan every 5 minutes
     MAX_TRADES       = 3
-    MIN_CONFIDENCE   = 90
+    MIN_CONFIDENCE   = 70
 
     job_start   = time.time()
     trades_sent = 0
