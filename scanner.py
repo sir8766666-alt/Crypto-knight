@@ -29,17 +29,19 @@ if not BOT_TOKEN or not CHAT_ID:
     )
 
 ASSETS = {
-    "EUR/USD": "EURUSD=X",
-    "GBP/USD": "GBPUSD=X",
-    "XAU/USD": "GC=F",
-    "OIL/USD": "CL=F",
-    "BTC/USD": "BTC-USD",
-    "USD/JPY": "JPY=X",
+    "EUR/USD": "EURUSD=X",   # confirmed on Pocket Option
+    "USD/JPY": "JPY=X",      # confirmed on Pocket Option
+    "AUD/USD": "AUDUSD=X",   # confirmed on Pocket Option
+    "EUR/JPY": "EURJPY=X",   # confirmed on Pocket Option
+    "AUD/CAD": "AUDCAD=X",   # confirmed on Pocket Option
+    "WTI/OIL": "CL=F",       # WTI Crude Oil — same price as OTC on Pocket Option
 }
 
 sent_this_run: set = set()
 
 # ── Market hours filter ───────────────────────────────────────────────────────
+OIL_ASSETS = {"WTI/OIL"}
+
 def is_market_active():
     now  = datetime.now(IST)
     wday = now.weekday()
@@ -48,6 +50,14 @@ def is_market_active():
     if wday == 6 and hour < 19: return False, "Sunday — not open yet"
     if 0 <= hour < 6: return False, "00:00–06:00 IST dead hours"
     return True, "ok"
+
+def is_asset_active(name):
+    """WTI futures close 01:00-02:30 IST daily — skip that window."""
+    now  = datetime.now(IST)
+    hour, minu = now.hour, now.minute
+    if name in OIL_ASSETS and hour == 1: return False
+    if name in OIL_ASSETS and hour == 2 and minu < 30: return False
+    return True
 
 # ── Indicators ────────────────────────────────────────────────────────────────
 def calc_adx(df, p=14):
@@ -156,14 +166,25 @@ def send_signals(signals):
         ]
     lines += ["──────────────────────", "⚠️ <i>Paper trading only.</i>"]
 
-    r = httpx.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        json={"chat_id": CHAT_ID, "text": "\n".join(lines), "parse_mode": "HTML"},
-        timeout=15,
-    )
-    print(f"  Telegram: {r.status_code}")
-    r.raise_for_status()
-    print(f"  ✅ Sent {len(signals)} signal(s)")
+    try:
+        r = httpx.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": "\n".join(lines), "parse_mode": "HTML"},
+            timeout=15,
+        )
+        print(f"  Telegram: {r.status_code}")
+        if r.status_code == 403:
+            print("  ❌ 403 Forbidden — bot not started or wrong Chat ID")
+            print("  👉 Open this in browser to find your real Chat ID:")
+            print(f"     https://api.telegram.org/bot{BOT_TOKEN}/getUpdates")
+            print("  👉 Then send /start to your bot and try again")
+            return
+        r.raise_for_status()
+        print(f"  ✅ Sent {len(signals)} signal(s)")
+    except httpx.HTTPStatusError as e:
+        print(f"  ❌ Telegram error: {e} — scanner continues")
+    except Exception as e:
+        print(f"  ❌ Network error: {e} — scanner continues")
 
 def heartbeat_if_needed():
     if datetime.now(IST).minute > 4:
@@ -202,6 +223,9 @@ def main():
             key = f"{name}-{datetime.now(IST).strftime('%H:%M')}"
             if key in sent_this_run:
                 print(f"  {name}: already sent this minute")
+                continue
+            if not is_asset_active(name):
+                print(f"  {name}: market closed right now")
                 continue
             result = analyze(name, ticker)
             if result:
