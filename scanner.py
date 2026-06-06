@@ -78,7 +78,7 @@ def analyze(name, ticker):
     df["adx"]   = calc_adx(df)
     df["rsi"]   = calc_rsi(df["close"])
 
-    r, p2, p3 = df.iloc[-1], df.iloc[-2], df.iloc[-3]
+    r, p2 = df.iloc[-1], df.iloc[-2]
 
     price     = float(r["close"])
     sma50     = float(r["sma50"])
@@ -88,30 +88,30 @@ def analyze(name, ticker):
     ema21_val = float(r["ema21"])
     sma_slope = float(r["sma50"]) - float(p2["sma50"])
 
-    # 3 consecutive candles same direction
-    candles_up   = float(r["close"]) > float(p2["close"]) > float(p3["close"])
-    candles_down = float(r["close"]) < float(p2["close"]) < float(p3["close"])
+    # Single candle confirmation
+    candle_up   = float(r["close"]) > float(p2["close"])
+    candle_down = float(r["close"]) < float(p2["close"])
 
-    if adx_val < 22: return None
-    if 44 < rsi_val < 56: return None
+    if adx_val < 20: return None
+    if 45 < rsi_val < 55: return None
 
     bull = (price > sma50 and sma_slope > 0
             and ema9_val > ema21_val
-            and rsi_val > 58 and candles_up)
+            and rsi_val > 55 and candle_up)
 
     bear = (price < sma50 and sma_slope < 0
             and ema9_val < ema21_val
-            and rsi_val < 42 and candles_down)
+            and rsi_val < 45 and candle_down)
 
     if not bull and not bear: return None
 
     signal = "UP" if bull else "DOWN"
 
     conf  = 50
-    conf += min(22, int((adx_val - 25) * 1.1))
+    conf += min(22, int((adx_val - 20) * 1.1))
     conf += min(18, int(abs(rsi_val - 50) * 0.6))
     conf += min(12, int(abs(ema9_val - ema21_val) / price * 25000))
-    conf += 8 if (candles_up or candles_down) else 0
+    conf += 8 if (candle_up or candle_down) else 0
     conf  = min(conf, 98)
 
     if conf < 80: return None
@@ -226,4 +226,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
+        
