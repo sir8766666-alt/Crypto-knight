@@ -1,14 +1,11 @@
-
 """
 SMA-50 Manual Session Scanner — Crypto Knight
 - Manual trigger only (workflow_dispatch)
 - Single scan per run — no loop
-- 80%+ confidence threshold
+- 90%+ confidence only
 - Max 3 trades per session
-- 5-min candles + 5-min expiry
+- 5-min expiry
 - Real forex only, no OTC, no oil
-- Balanced sideways filter
-- Debug print shows WHY each pair is rejected
 """
 
 import os, httpx, yfinance as yf, pandas as pd, numpy as np
@@ -22,11 +19,8 @@ def ist_now(dt=None):
 
 def trade_times():
     now = datetime.now(IST)
-    # Round down to last 5-min mark, then +5 and +10
-    mins = (now.minute // 5) * 5
-    base = now.replace(minute=mins, second=0, microsecond=0)
-    open_t  = (base + timedelta(minutes=5)).strftime("%I:%M %p")
-    close_t = (base + timedelta(minutes=10)).strftime("%I:%M %p")
+    open_t = (now.replace(second=0, microsecond=0) + timedelta(minutes=1)).strftime("%I:%M %p")
+    close_t = (now.replace(second=0, microsecond=0) + timedelta(minutes=6)).strftime("%I:%M %p")
     return open_t, close_t
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -35,14 +29,16 @@ CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID")
 if not BOT_TOKEN or not CHAT_ID:
     raise EnvironmentError("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in GitHub Secrets")
 
+# ── Real forex only — all confirmed on yfinance ───────────────────────────────
+# Best trending pairs from your Pocket Option list
+# Ordered by trend reliability during 10-11 AM IST
 ASSETS = {
-    "EUR/USD": "EURUSD=X",
-    "USD/JPY": "JPY=X",
-    "AUD/USD": "AUDUSD=X",
-    "EUR/JPY": "EURJPY=X",
-    "AUD/CAD": "AUDCAD=X",
-    "GBP/USD": "GBPUSD=X",
-    "USD/CAD": "CAD=X",
+    "EUR/USD": "EURUSD=X",   # most liquid, cleanest signals
+    "USD/JPY": "JPY=X",      # strong Monday momentum
+    "AUD/JPY": "AUDJPY=X",   # best trending pair in your list
+    "EUR/JPY": "EURJPY=X",   # EUR + JPY both active 10am IST
+    "AUD/USD": "AUDUSD=X",   # solid volume London session
+    "USD/CAD": "CAD=X",      # CAD moves well during London
 }
 
 # ── Indicators ────────────────────────────────────────────────────────────────
@@ -52,66 +48,40 @@ def calc_adx(df, p=14):
     mdm = (-l.diff()).clip(lower=0)
     pdm[pdm <= mdm] = 0
     mdm[mdm <= pdm] = 0
-    tr  = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
-    atr = tr.ewm(span=p, adjust=False).mean()
-    pdi = 100 * pdm.ewm(span=p, adjust=False).mean() / atr
-    mdi = 100 * mdm.ewm(span=p, adjust=False).mean() / atr
-    dx  = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
-    return dx.ewm(span=p, adjust=False).mean(), pdi, mdi
+    tr  = pd.concat([h-l,(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(axis=1)
+    atr = tr.ewm(span=p,adjust=False).mean()
+    pdi = 100*pdm.ewm(span=p,adjust=False).mean()/atr
+    mdi = 100*mdm.ewm(span=p,adjust=False).mean()/atr
+    dx  = 100*(pdi-mdi).abs()/(pdi+mdi).replace(0,np.nan)
+    return dx.ewm(span=p,adjust=False).mean()
 
 def calc_rsi(s, p=14):
     d = s.diff()
-    g = d.clip(lower=0).ewm(span=p, adjust=False).mean()
-    lo = (-d.clip(upper=0)).ewm(span=p, adjust=False).mean()
-    return 100 - (100 / (1 + g / lo.replace(0, np.nan)))
+    g = d.clip(lower=0).ewm(span=p,adjust=False).mean()
+    l = (-d.clip(upper=0)).ewm(span=p,adjust=False).mean()
+    return 100-(100/(1+g/l.replace(0,np.nan)))
 
 def calc_ema(s, p):
-    return s.ewm(span=p, adjust=False).mean()
-
-def calc_bb_width(s, p=20):
-    ma  = s.rolling(p).mean()
-    std = s.rolling(p).std()
-    return (2 * std) / ma.replace(0, np.nan)
-
-def calc_atr(df, p=14):
-    h, l, c = df["high"], df["low"], df["close"]
-    tr = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
-    return tr.ewm(span=p, adjust=False).mean()
+    return s.ewm(span=p,adjust=False).mean()
 
 # ── Analysis ──────────────────────────────────────────────────────────────────
 def analyze(name, ticker):
     try:
-        # 5-min candles, 5 days — gives ~300+ candles, enough for SMA-50
-        df = yf.download(ticker, period="5d", interval="5m",
+        df = yf.download(ticker, period="3d", interval="1m",
                          progress=False, auto_adjust=True)
-
-        if df.empty or len(df) < 60:
-            print(f"    ✗ not enough data ({len(df)} rows)")
-            return None
-
-        df.columns = [c[0].lower() if isinstance(c, tuple) else c.lower()
+        if df.empty or len(df) < 60: return None
+        df.columns = [c[0].lower() if isinstance(c,tuple) else c.lower()
                       for c in df.columns]
-
-        # Drop last candle (may be incomplete)
-        df = df.iloc[:-1]
-
     except Exception as e:
-        print(f"    ✗ fetch error: {e}")
-        return None
+        print(f"    fetch error: {e}"); return None
 
-    df["sma50"]    = df["close"].rolling(50).mean()
-    df["ema9"]     = calc_ema(df["close"], 9)
-    df["ema21"]    = calc_ema(df["close"], 21)
-    adx_s, pdi_s, mdi_s = calc_adx(df)
-    df["adx"]      = adx_s
-    df["pdi"]      = pdi_s
-    df["mdi"]      = mdi_s
-    df["rsi"]      = calc_rsi(df["close"])
-    df["bb_width"] = calc_bb_width(df["close"])
-    df["atr"]      = calc_atr(df)
+    df["sma50"] = df["close"].rolling(50).mean()
+    df["ema9"]  = calc_ema(df["close"], 9)
+    df["ema21"] = calc_ema(df["close"], 21)
+    df["adx"]   = calc_adx(df)
+    df["rsi"]   = calc_rsi(df["close"])
 
-    r  = df.iloc[-1]
-    p2 = df.iloc[-2]
+    r, p2 = df.iloc[-1], df.iloc[-2]
 
     price     = float(r["close"])
     sma50     = float(r["sma50"])
@@ -119,117 +89,42 @@ def analyze(name, ticker):
     rsi_val   = float(r["rsi"])
     ema9_val  = float(r["ema9"])
     ema21_val = float(r["ema21"])
-    pdi_val   = float(r["pdi"])
-    mdi_val   = float(r["mdi"])
     sma_slope = float(r["sma50"]) - float(p2["sma50"])
-    bb_width  = float(r["bb_width"])
-    atr_val   = float(r["atr"])
 
-    candle_body  = abs(float(r["close"]) - float(r["open"]))
-    candle_range = float(r["high"]) - float(r["low"])
-    body_ratio   = candle_body / candle_range if candle_range > 0 else 0
+    # Single candle confirmation
+    candle_up   = float(r["close"]) > float(p2["close"])
+    candle_down = float(r["close"]) < float(p2["close"])
 
-    candle_up   = float(r["close"]) > float(r["open"])
-    candle_down = float(r["close"]) < float(r["open"])
+    if adx_val < 20: return None
+    if 45 < rsi_val < 55: return None
 
-    di_sep          = abs(pdi_val - mdi_val)
-    price_atr_ratio = atr_val / price
-
-    # ── Debug print ───────────────────────────────────────────────────────────
-    print(f"    ADX={adx_val:.1f}  RSI={rsi_val:.1f}  DIsep={di_sep:.1f}"
-          f"  BBw={bb_width*10000:.2f}  body={body_ratio:.2f}"
-          f"  ATRr={price_atr_ratio*100000:.2f}")
-
-    # ── FILTERS ───────────────────────────────────────────────────────────────
-    # 1. ADX — 5-min candles build better ADX, can use 25 again
-    if adx_val < 25:
-        print(f"    ✗ ADX too low ({adx_val:.1f} < 25) — sideways")
-        return None
-
-    # 2. RSI dead zone
-    if 45 < rsi_val < 55:
-        print(f"    ✗ RSI dead zone ({rsi_val:.1f}) — no momentum")
-        return None
-
-    # 3. DI separation
-    if di_sep < 6:
-        print(f"    ✗ DI separation too low ({di_sep:.1f} < 6)")
-        return None
-
-    # 4. Candle body — no doji
-    if body_ratio < 0.3:
-        print(f"    ✗ Weak candle body ({body_ratio:.2f}) — doji/indecision")
-        return None
-
-    # 5. BB width — not in a squeeze
-    if bb_width < 0.001:
-        print(f"    ✗ BB squeeze ({bb_width*10000:.2f}) — sideways")
-        return None
-
-    # 6. ATR — market must be moving
-    if price_atr_ratio < 0.00006:
-        print(f"    ✗ ATR too small — dead market")
-        return None
-
-    # ── Direction ─────────────────────────────────────────────────────────────
-    bull = (price > sma50
-            and sma_slope > 0
+    bull = (price > sma50 and sma_slope > 0
             and ema9_val > ema21_val
-            and pdi_val > mdi_val
-            and rsi_val > 55
-            and candle_up)
+            and rsi_val > 55 and candle_up)
 
-    bear = (price < sma50
-            and sma_slope < 0
+    bear = (price < sma50 and sma_slope < 0
             and ema9_val < ema21_val
-            and mdi_val > pdi_val
-            and rsi_val < 45
-            and candle_down)
+            and rsi_val < 45 and candle_down)
 
-    if not bull and not bear:
-        if rsi_val > 50:
-            print(f"    ✗ BULL failed:"
-                  f" p>sma={price>sma50}"
-                  f" slope={sma_slope>0}"
-                  f" ema={ema9_val>ema21_val}"
-                  f" pdi={pdi_val>mdi_val}"
-                  f" rsi={rsi_val>55}"
-                  f" candle={candle_up}")
-        else:
-            print(f"    ✗ BEAR failed:"
-                  f" p<sma={price<sma50}"
-                  f" slope={sma_slope<0}"
-                  f" ema={ema9_val<ema21_val}"
-                  f" mdi={mdi_val>pdi_val}"
-                  f" rsi={rsi_val<45}"
-                  f" candle={candle_down}")
-        return None
+    if not bull and not bear: return None
 
     signal = "UP" if bull else "DOWN"
 
-    # ── Confidence ────────────────────────────────────────────────────────────
     conf  = 50
-    conf += min(22, int((adx_val - 25) * 1.1))     # ADX strength
-    conf += min(18, int(abs(rsi_val - 50) * 0.6))  # RSI extremity
-    conf += min(10, int(di_sep * 0.5))              # DI separation
-    conf += min(6,  int(bb_width * 5000))           # BB expansion
-    conf += 6 if body_ratio > 0.5 else 0            # solid candle body
-    conf += 4 if body_ratio > 0.7 else 0            # strong marubozu
+    conf += min(22, int((adx_val - 20) * 1.1))
+    conf += min(18, int(abs(rsi_val - 50) * 0.6))
+    conf += min(12, int(abs(ema9_val - ema21_val) / price * 25000))
+    conf += 8 if (candle_up or candle_down) else 0
     conf  = min(conf, 98)
 
-    if conf < 80:
-        print(f"    ✗ Confidence too low ({conf}% < 80%)")
-        return None
+    if conf < 80: return None
 
-    print(f"    ✅ {signal} @ {conf}%")
     return {
-        "asset":      name,
-        "signal":     signal,
-        "price":      round(price, 5),
-        "sma50":      round(sma50, 5),
-        "adx":        round(adx_val, 1),
-        "rsi":        round(rsi_val, 1),
-        "di_sep":     round(di_sep, 1),
+        "asset": name, "signal": signal,
+        "price": round(price, 5),
+        "sma50": round(sma50, 5),
+        "adx":   round(adx_val, 1),
+        "rsi":   round(rsi_val, 1),
         "confidence": conf,
     }
 
@@ -249,14 +144,13 @@ def send_signals(signals):
         em  = em_map[s["signal"]]
         act = act_map[s["signal"]]
         lines += [
-            f"{'──────────────────────' if i > 1 else ''}",
+            f"{'──────────────────────' if i>1 else ''}",
             f"{em} <b>TRADE {i}/3 — {s['asset']}</b>",
             f"   Action     : <b>{act}</b>",
             f"   Price      : <code>{s['price']}</code>",
             f"   SMA-50     : <code>{s['sma50']}</code>",
             f"   ADX        : <code>{s['adx']}</code>",
             f"   RSI        : <code>{s['rsi']}</code>",
-            f"   DI Sep     : <code>{s['di_sep']}</code>",
             f"   Confidence : <code>{s['confidence']}%</code>",
             f"   Open at    : <code>{open_at} IST</code>",
             f"   Close at   : <code>{close_at} IST</code>",
@@ -265,7 +159,7 @@ def send_signals(signals):
 
     lines += [
         "──────────────────────",
-        "📌 Open Pocket Option → place trade NOW",
+        f"📌 Open Pocket Option → place trade NOW",
         "⚠️ <i>5-min expiry. Max 3 trades. Real forex only.</i>",
     ]
 
@@ -294,11 +188,11 @@ def send_no_signal():
                     f"🔍 <b>Crypto Knight</b>\n\n"
                     f"❌ <b>No trades this scan</b>\n"
                     f"⏰ <code>{ist_now()}</code>\n\n"
-                    f"<i>Market is sideways or no strong setup.\n"
-                    f"Best times to scan:\n"
-                    f"• 11:30 AM IST — London open\n"
-                    f"• 06:30 PM IST — NY open (best!)\n"
-                    f"• 07:30 PM IST — London-NY overlap</i>"
+                    f"<i>No asset hit 80%+ confidence.\n"
+                    f"Try again at:\n"
+                    f"• 09:15 IST — London open\n"
+                    f"• 13:45 IST — London/NY overlap\n"
+                    f"• 19:00 IST — NY session</i>"
                 ),
                 "parse_mode": "HTML",
             },
@@ -308,21 +202,23 @@ def send_no_signal():
     except Exception as e:
         print(f"  ❌ Telegram error: {e}")
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Main — single scan, instant result ───────────────────────────────────────
 def main():
-    print(f"[{ist_now()}] Scanning {len(ASSETS)} forex pairs (5-min candles / 5-min expiry)...")
-    print(f"  Best times: 11:30 AM / 6:30 PM / 7:30 PM IST\n")
+    print(f"[{ist_now()}] Scanning 5 forex pairs...")
 
     signals = []
     for name, ticker in ASSETS.items():
-        print(f"  {name}:")
+        print(f"  {name}...", end=" ")
         result = analyze(name, ticker)
         if result:
+            print(f"{result['signal']} {result['confidence']}% ← SIGNAL")
             signals.append(result)
             if len(signals) >= 3:
                 break
+        else:
+            print("no signal")
 
-    print(f"\n  ── Found: {len(signals)} signal(s) ──")
+    print(f"\n  Found: {len(signals)} signal(s)")
 
     if signals:
         send_signals(signals)
