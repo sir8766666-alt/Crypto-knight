@@ -67,7 +67,7 @@ def calc_ema(s, p):
 # ── Analysis ──────────────────────────────────────────────────────────────────
 def analyze(name, ticker):
     try:
-        df = yf.download(ticker, period="3d", interval="1m",
+        df = yf.download(ticker, period="5d", interval="5m",
                          progress=False, auto_adjust=True)
         if df.empty or len(df) < 60: return None
         df.columns = [c[0].lower() if isinstance(c,tuple) else c.lower()
@@ -95,8 +95,19 @@ def analyze(name, ticker):
     candle_up   = float(r["close"]) > float(p2["close"])
     candle_down = float(r["close"]) < float(p2["close"])
 
-    if adx_val < 20: return None
+    # ── Sideways filters — THREE layers ──────────────────────────────────
+    # 1. ADX must show real trend
+    if adx_val < 25: return None
+
+    # 2. RSI dead zone — no momentum
     if 45 < rsi_val < 55: return None
+
+    # 3. Price range filter — if last 10 candles too tight = ranging
+    recent       = df.tail(10)
+    range_size   = float(recent["high"].max() - recent["low"].min())
+    avg_price    = float(recent["close"].mean())
+    range_pct    = (range_size / avg_price) * 100
+    if range_pct < 0.05: return None   # less than 0.05% range = dead sideways
 
     bull = (price > sma50 and sma_slope > 0
             and ema9_val > ema21_val
@@ -229,4 +240,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
+        
