@@ -1,11 +1,7 @@
 """
-SMA-50 Manual Session Scanner — Crypto Knight
-- Manual trigger only (workflow_dispatch)
-- Single scan per run — no loop
-- 90%+ confidence only
-- Max 3 trades per session
-- 5-min expiry
-- Real forex only, no OTC, no oil
+Crypto Knight — SMA50 + MACD + ADX + RSI + Bollinger
+No API keys needed. Pure indicator logic.
+M5 candles. 5-min expiry. 80%+ confidence only.
 """
 
 import os, httpx, yfinance as yf, pandas as pd, numpy as np
@@ -18,8 +14,8 @@ def ist_now(dt=None):
     return d.strftime("%d %b %Y  %I:%M %p IST")
 
 def trade_times():
-    now = datetime.now(IST)
-    open_t = (now.replace(second=0, microsecond=0) + timedelta(minutes=1)).strftime("%I:%M %p")
+    now     = datetime.now(IST)
+    open_t  = (now.replace(second=0, microsecond=0) + timedelta(minutes=1)).strftime("%I:%M %p")
     close_t = (now.replace(second=0, microsecond=0) + timedelta(minutes=6)).strftime("%I:%M %p")
     return open_t, close_t
 
@@ -29,16 +25,13 @@ CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID")
 if not BOT_TOKEN or not CHAT_ID:
     raise EnvironmentError("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in GitHub Secrets")
 
-# ── Real forex only — all confirmed on yfinance ───────────────────────────────
-# Best trending pairs from your Pocket Option list
-# Ordered by trend reliability during 10-11 AM IST
 ASSETS = {
-    "EUR/USD": "EURUSD=X",   # most liquid, cleanest signals
-    "USD/JPY": "JPY=X",      # strong Monday momentum
-    "AUD/JPY": "AUDJPY=X",   # best trending pair in your list
-    "EUR/JPY": "EURJPY=X",   # EUR + JPY both active 10am IST
-    "AUD/USD": "AUDUSD=X",   # solid volume London session
-    "USD/CAD": "CAD=X",      # CAD moves well during London
+    "EUR/USD": "EURUSD=X",
+    "USD/JPY": "JPY=X",
+    "AUD/JPY": "AUDJPY=X",
+    "EUR/JPY": "EURJPY=X",
+    "AUD/USD": "AUDUSD=X",
+    "USD/CAD": "CAD=X",
 }
 
 # ── Indicators ────────────────────────────────────────────────────────────────
@@ -53,7 +46,7 @@ def calc_adx(df, p=14):
     pdi = 100*pdm.ewm(span=p,adjust=False).mean()/atr
     mdi = 100*mdm.ewm(span=p,adjust=False).mean()/atr
     dx  = 100*(pdi-mdi).abs()/(pdi+mdi).replace(0,np.nan)
-    return dx.ewm(span=p,adjust=False).mean()
+    return dx.ewm(span=p,adjust=False).mean(), pdi, mdi
 
 def calc_rsi(s, p=14):
     d = s.diff()
@@ -61,10 +54,20 @@ def calc_rsi(s, p=14):
     l = (-d.clip(upper=0)).ewm(span=p,adjust=False).mean()
     return 100-(100/(1+g/l.replace(0,np.nan)))
 
-def calc_ema(s, p):
-    return s.ewm(span=p,adjust=False).mean()
+def calc_macd(s):
+    ema12    = s.ewm(span=12, adjust=False).mean()
+    ema26    = s.ewm(span=26, adjust=False).mean()
+    macd     = ema12 - ema26
+    signal   = macd.ewm(span=9, adjust=False).mean()
+    hist     = macd - signal
+    return macd, signal, hist
 
-# ── Analysis ──────────────────────────────────────────────────────────────────
+def calc_bollinger(s, p=20):
+    mid = s.rolling(p).mean()
+    std = s.rolling(p).std()
+    return mid + 2*std, mid, mid - 2*std
+
+# ── Core analysis ─────────────────────────────────────────────────────────────
 def analyze(name, ticker):
     try:
         df = yf.download(ticker, period="5d", interval="5m",
@@ -73,168 +76,211 @@ def analyze(name, ticker):
         df.columns = [c[0].lower() if isinstance(c,tuple) else c.lower()
                       for c in df.columns]
     except Exception as e:
-        print(f"    fetch error: {e}"); return None
+        print(f"fetch error: {e}"); return None
 
-    df["sma50"] = df["close"].rolling(50).mean()
-    df["ema9"]  = calc_ema(df["close"], 9)
-    df["ema21"] = calc_ema(df["close"], 21)
-    df["adx"]   = calc_adx(df)
-    df["rsi"]   = calc_rsi(df["close"])
+    df["sma50"]               = df["close"].rolling(50).mean()
+    df["ema9"]                = df["close"].ewm(span=9,  adjust=False).mean()
+    df["ema21"]               = df["close"].ewm(span=21, adjust=False).mean()
+    df["adx"], df["pdi"], df["mdi"] = calc_adx(df)
+    df["rsi"]                 = calc_rsi(df["close"])
+    df["macd"], df["macd_sig"], df["macd_hist"] = calc_macd(df["close"])
+    df["bb_up"], df["bb_mid"], df["bb_low"]     = calc_bollinger(df["close"])
 
     r, p2 = df.iloc[-1], df.iloc[-2]
 
-    price     = float(r["close"])
-    sma50     = float(r["sma50"])
-    adx_val   = float(r["adx"])
-    rsi_val   = float(r["rsi"])
-    ema9_val  = float(r["ema9"])
-    ema21_val = float(r["ema21"])
-    sma_slope = float(r["sma50"]) - float(p2["sma50"])
+    price    = float(r["close"])
+    sma50    = float(r["sma50"])
+    adx_val  = float(r["adx"])
+    pdi      = float(r["pdi"])
+    mdi      = float(r["mdi"])
+    rsi_val  = float(r["rsi"])
+    ema9     = float(r["ema9"])
+    ema21    = float(r["ema21"])
+    macd_now = float(r["macd"])
+    sig_now  = float(r["macd_sig"])
+    hist_now = float(r["macd_hist"])
+    hist_prv = float(p2["macd_hist"])
+    bb_up    = float(r["bb_up"])
+    bb_low   = float(r["bb_low"])
+    sma_slope = sma50 - float(p2["sma50"])
 
-    # Single candle confirmation
-    candle_up   = float(r["close"]) > float(p2["close"])
-    candle_down = float(r["close"]) < float(p2["close"])
+    # ── LAYER 1: Sideways filter ──────────────────────────────────────────────
+    recent    = df.tail(10)
+    range_pct = (float(recent["high"].max()-recent["low"].min())/price)*100
 
-    # ── Sideways filters — THREE layers ──────────────────────────────────
-    # 1. ADX must show real trend
-    if adx_val < 25: return None
+    if adx_val < 22:
+        return None, f"ADX {adx_val:.1f} — no trend"
+    if range_pct < 0.05:
+        return None, f"Range {range_pct:.3f}% — dead market"
+    if 46 < rsi_val < 54:
+        return None, f"RSI {rsi_val:.1f} — no momentum"
 
-    # 2. RSI dead zone — no momentum
-    if 45 < rsi_val < 55: return None
+    # ── LAYER 2: MACD crossover (direction engine) ────────────────────────────
+    # MACD histogram growing = momentum building in that direction
+    macd_bull = macd_now > sig_now and hist_now > hist_prv and hist_now > 0
+    macd_bear = macd_now < sig_now and hist_now < hist_prv and hist_now < 0
 
-    # 3. Price range filter — if last 10 candles too tight = ranging
-    recent       = df.tail(10)
-    range_size   = float(recent["high"].max() - recent["low"].min())
-    avg_price    = float(recent["close"].mean())
-    range_pct    = (range_size / avg_price) * 100
-    if range_pct < 0.05: return None   # less than 0.05% range = dead sideways
+    # Fresh crossover this candle (strongest signal)
+    macd_cross_up   = macd_now > sig_now and float(p2["macd"]) <= float(p2["macd_sig"])
+    macd_cross_down = macd_now < sig_now and float(p2["macd"]) >= float(p2["macd_sig"])
 
-    bull = (price > sma50 and sma_slope > 0
-            and ema9_val > ema21_val
-            and rsi_val > 55 and candle_up)
+    # ── LAYER 3: Trend confirmation ───────────────────────────────────────────
+    trend_up   = price > sma50 and sma_slope > 0 and ema9 > ema21 and pdi > mdi
+    trend_down = price < sma50 and sma_slope < 0 and ema9 < ema21 and mdi > pdi
 
-    bear = (price < sma50 and sma_slope < 0
-            and ema9_val < ema21_val
-            and rsi_val < 45 and candle_down)
+    # ── LAYER 4: RSI confirmation ─────────────────────────────────────────────
+    rsi_bull = rsi_val > 54 and rsi_val < 75   # bullish but not overbought
+    rsi_bear = rsi_val < 46 and rsi_val > 25   # bearish but not oversold
 
-    if not bull and not bear: return None
+    # ── LAYER 5: Bollinger — avoid trading at extremes ────────────────────────
+    at_bb_top = price >= bb_up * 0.9999   # overbought — don't call UP
+    at_bb_bot = price <= bb_low * 1.0001  # oversold  — don't call DOWN
+
+    # ── Signal logic — ALL layers must agree ──────────────────────────────────
+    bull = (trend_up and rsi_bull
+            and (macd_bull or macd_cross_up)
+            and not at_bb_top)
+
+    bear = (trend_down and rsi_bear
+            and (macd_bear or macd_cross_down)
+            and not at_bb_bot)
+
+    if not bull and not bear:
+        reasons = []
+        if not trend_up and not trend_down: reasons.append("trend mixed")
+        if not rsi_bull and not rsi_bear:   reasons.append(f"RSI {rsi_val:.0f} neutral")
+        if not macd_bull and not macd_bear: reasons.append("MACD no momentum")
+        return None, " / ".join(reasons) or "indicators not aligned"
 
     signal = "UP" if bull else "DOWN"
 
-    conf  = 50
-    conf += min(22, int((adx_val - 20) * 1.1))
-    conf += min(18, int(abs(rsi_val - 50) * 0.6))
-    conf += min(12, int(abs(ema9_val - ema21_val) / price * 25000))
-    conf += 8 if (candle_up or candle_down) else 0
-    conf  = min(conf, 98)
+    # ── Confidence scoring ────────────────────────────────────────────────────
+    conf = 50
 
-    if conf < 80: return None
+    # ADX strength
+    conf += min(15, int((adx_val - 22) * 0.8))
+
+    # RSI extremity
+    conf += min(12, int(abs(rsi_val - 50) * 0.5))
+
+    # MACD crossover bonus — freshest signal = highest confidence
+    if macd_cross_up or macd_cross_down:
+        conf += 15
+    elif macd_bull or macd_bear:
+        conf += 8
+
+    # EMA separation
+    ema_gap = abs(ema9 - ema21) / price * 10000
+    conf += min(8, int(ema_gap * 1.5))
+
+    # DI separation (how dominant the trend direction is)
+    di_gap = abs(pdi - mdi)
+    conf += min(8, int(di_gap * 0.3))
+
+    conf = min(conf, 98)
+
+    if conf < 80:
+        return None, f"Confidence {conf}% < 80%"
 
     return {
-        "asset": name, "signal": signal,
-        "price": round(price, 5),
-        "sma50": round(sma50, 5),
-        "adx":   round(adx_val, 1),
-        "rsi":   round(rsi_val, 1),
+        "asset":      name,
+        "signal":     signal,
+        "price":      round(price, 5),
+        "sma50":      round(sma50, 5),
+        "adx":        round(adx_val, 1),
+        "rsi":        round(rsi_val, 1),
+        "macd":       round(macd_now, 6),
+        "macd_sig":   round(sig_now, 6),
         "confidence": conf,
-    }
+        "fresh_cross": macd_cross_up or macd_cross_down,
+    }, None
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
 def send_signals(signals):
     open_at, close_at = trade_times()
-    em_map  = {"UP": "🟢", "DOWN": "🔴"}
-    act_map = {"UP": "CALL  ▲  (UP)", "DOWN": "PUT  ▼  (DOWN)"}
-
     lines = [
-        f"🎯 <b>Crypto Knight — {len(signals)} SIGNAL{'S' if len(signals)>1 else ''}</b>",
+        "🎯 <b>Crypto Knight Signal</b>",
         f"⏰ <code>{ist_now()}</code>",
         "",
     ]
-
     for i, s in enumerate(signals, 1):
-        em  = em_map[s["signal"]]
-        act = act_map[s["signal"]]
+        em  = "🟢" if s["signal"] == "UP" else "🔴"
+        act = "CALL  ▲  (UP)" if s["signal"] == "UP" else "PUT  ▼  (DOWN)"
+        cross = "⚡ <b>Fresh MACD crossover!</b>" if s.get("fresh_cross") else ""
         lines += [
-            f"{'──────────────────────' if i>1 else ''}",
+            "──────────────────────" if i > 1 else "",
             f"{em} <b>TRADE {i}/3 — {s['asset']}</b>",
             f"   Action     : <b>{act}</b>",
             f"   Price      : <code>{s['price']}</code>",
-            f"   SMA-50     : <code>{s['sma50']}</code>",
             f"   ADX        : <code>{s['adx']}</code>",
             f"   RSI        : <code>{s['rsi']}</code>",
+            f"   MACD       : <code>{s['macd']}</code>",
             f"   Confidence : <code>{s['confidence']}%</code>",
+            cross,
             f"   Open at    : <code>{open_at} IST</code>",
             f"   Close at   : <code>{close_at} IST</code>",
             "",
         ]
-
     lines += [
         "──────────────────────",
-        f"📌 Open Pocket Option → place trade NOW",
-        "⚠️ <i>5-min expiry. Max 3 trades. Real forex only.</i>",
+        "📌 <b>Set Pocket Option expiry → 5 mins</b>",
+        "⚠️ <i>Max 3 trades. Stop after 1 loss.</i>",
     ]
+    _tg(lines)
 
+def send_no_signal(skips):
+    lines = [
+        "🔍 <b>Crypto Knight</b>",
+        f"⏰ <code>{ist_now()}</code>",
+        "",
+        "❌ <b>No trades this scan</b>",
+        "<i>All indicators not aligned on any pair.</i>",
+        "",
+        "📋 Skip reasons:",
+    ]
+    for name, reason in skips.items():
+        lines.append(f"   • {name}: {reason}")
+    lines += [
+        "",
+        "<i>Retry at:\n• 10:00–11:00 IST\n• 13:45–15:30 IST\n• 19:00–21:00 IST</i>",
+    ]
+    _tg(lines)
+
+def _tg(lines):
     try:
         r = httpx.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": "\n".join(lines), "parse_mode": "HTML"},
+            json={"chat_id":CHAT_ID,"text":"\n".join(lines),"parse_mode":"HTML"},
             timeout=15,
         )
-        print(f"  Telegram: {r.status_code}")
         if r.status_code == 403:
-            print("  ❌ 403 — send /start to your bot and check Chat ID in Secrets")
-            return
+            print("❌ 403 — send /start to your bot"); return
         r.raise_for_status()
-        print(f"  ✅ Sent {len(signals)} signal(s)")
+        print("✅ Telegram sent")
     except Exception as e:
-        print(f"  ❌ Telegram error: {e}")
+        print(f"❌ Telegram: {e}")
 
-def send_no_signal():
-    try:
-        httpx.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={
-                "chat_id": CHAT_ID,
-                "text": (
-                    f"🔍 <b>Crypto Knight</b>\n\n"
-                    f"❌ <b>No trades this scan</b>\n"
-                    f"⏰ <code>{ist_now()}</code>\n\n"
-                    f"<i>No asset hit 80%+ confidence.\n"
-                    f"Try again at:\n"
-                    f"• 09:15 IST — London open\n"
-                    f"• 13:45 IST — London/NY overlap\n"
-                    f"• 19:00 IST — NY session</i>"
-                ),
-                "parse_mode": "HTML",
-            },
-            timeout=15,
-        )
-        print("  ✅ No-signal message sent")
-    except Exception as e:
-        print(f"  ❌ Telegram error: {e}")
-
-# ── Main — single scan, instant result ───────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    print(f"[{ist_now()}] Scanning 5 forex pairs...")
+    print(f"[{ist_now()}] Scanning...")
+    signals, skips = [], {}
 
-    signals = []
     for name, ticker in ASSETS.items():
-        print(f"  {name}...", end=" ")
-        result = analyze(name, ticker)
+        print(f"  {name}... ", end="", flush=True)
+        result, skip_reason = analyze(name, ticker)
         if result:
-            print(f"{result['signal']} {result['confidence']}% ← SIGNAL")
+            print(f"✅ {result['signal']} {result['confidence']}%")
             signals.append(result)
-            if len(signals) >= 3:
-                break
+            if len(signals) >= 3: break
         else:
-            print("no signal")
+            print(f"skip — {skip_reason}")
+            skips[name] = skip_reason
 
-    print(f"\n  Found: {len(signals)} signal(s)")
-
+    print(f"\n  Signals: {len(signals)}")
     if signals:
         send_signals(signals)
     else:
-        send_no_signal()
+        send_no_signal(skips)
 
     print(f"[{ist_now()}] Done")
 
