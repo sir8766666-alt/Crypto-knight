@@ -108,17 +108,17 @@ def analyze(name, ticker):
     recent    = df.tail(10)
     range_pct = (float(recent["high"].max()-recent["low"].min())/price)*100
 
-    if adx_val < 22:
+    if adx_val < 18:
         return None, f"ADX {adx_val:.1f} — no trend"
     if range_pct < 0.05:
         return None, f"Range {range_pct:.3f}% — dead market"
-    if 46 < rsi_val < 54:
+    if 47 < rsi_val < 53:
         return None, f"RSI {rsi_val:.1f} — no momentum"
 
     # ── LAYER 2: MACD crossover (direction engine) ────────────────────────────
     # MACD histogram growing = momentum building in that direction
-    macd_bull = macd_now > sig_now and hist_now > hist_prv and hist_now > 0
-    macd_bear = macd_now < sig_now and hist_now < hist_prv and hist_now < 0
+    macd_bull = hist_now > hist_prv and macd_now > sig_now   # growing momentum
+    macd_bear = hist_now < hist_prv and macd_now < sig_now   # growing momentum
 
     # Fresh crossover this candle (strongest signal)
     macd_cross_up   = macd_now > sig_now and float(p2["macd"]) <= float(p2["macd_sig"])
@@ -179,7 +179,7 @@ def analyze(name, ticker):
 
     conf = min(conf, 98)
 
-    if conf < 80:
+    if conf < 75:
         return None, f"Confidence {conf}% < 80%"
 
     return {
@@ -286,4 +286,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-        
+    
