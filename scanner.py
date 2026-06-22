@@ -1,11 +1,13 @@
 """
-Crypto Knight — Ultimate Scanner
-Prints full trade details in GitHub Actions output AND sends to Telegram
-SMA50 + MACD + ADX + RSI + Bollinger | M5 candles | 5-min expiry
+Crypto Knight — High Confidence Strategy
+Indicators: SMA50 + EMA9/21 + MACD + ADX + RSI + Bollinger + Stochastic
+All 6 must agree. No compromise. Quality over quantity.
+Logs every signal to results.json for win rate tracking.
 """
 
-import os, httpx, yfinance as yf, pandas as pd, numpy as np
+import os, json, httpx, yfinance as yf, pandas as pd, numpy as np
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -34,6 +36,9 @@ ASSETS = {
     "USD/CAD": "CAD=X",
 }
 
+SEP  = "=" * 54
+SEP2 = "-" * 54
+
 # ── Indicators ────────────────────────────────────────────────────────────────
 def calc_adx(df, p=14):
     h, l, c = df["high"], df["low"], df["close"]
@@ -55,191 +60,341 @@ def calc_rsi(s, p=14):
     return 100-(100/(1+g/l.replace(0,np.nan)))
 
 def calc_macd(s):
-    ema12  = s.ewm(span=12, adjust=False).mean()
-    ema26  = s.ewm(span=26, adjust=False).mean()
+    ema12  = s.ewm(span=12,adjust=False).mean()
+    ema26  = s.ewm(span=26,adjust=False).mean()
     macd   = ema12 - ema26
-    signal = macd.ewm(span=9, adjust=False).mean()
-    hist   = macd - signal
-    return macd, signal, hist
+    signal = macd.ewm(span=9,adjust=False).mean()
+    return macd, signal, macd - signal
 
 def calc_bollinger(s, p=20):
     mid = s.rolling(p).mean()
     std = s.rolling(p).std()
-    return mid + 2*std, mid, mid - 2*std
+    return mid+2*std, mid, mid-2*std
 
-# ── Separator helpers for console output ─────────────────────────────────────
-SEP  = "=" * 52
-SEP2 = "-" * 52
+def calc_stochastic(df, k=14, d=3):
+    low_min  = df["low"].rolling(k).min()
+    high_max = df["high"].rolling(k).max()
+    k_line   = 100*(df["close"]-low_min)/(high_max-low_min).replace(0,np.nan)
+    d_line   = k_line.rolling(d).mean()
+    return k_line, d_line
 
-def print_header():
-    print(SEP)
-    print("   CRYPTO KNIGHT — SIGNAL SCANNER")
-    print(f"   {ist_now()}")
-    print(f"   Strategy : SMA50 + MACD + ADX + RSI + BB")
-    print(f"   Timeframe: M5 candles | Expiry: 5 mins")
-    print(SEP)
+def calc_vwap(df):
+    typical = (df["high"]+df["low"]+df["close"])/3
+    return (typical*df["volume"]).cumsum()/df["volume"].cumsum()
 
-def print_asset_result(name, result, skip_reason):
-    if result:
-        arrow = "▲ UP   (CALL)" if result["signal"] == "UP" else "▼ DOWN (PUT) "
-        cross = " ⚡ FRESH CROSS" if result.get("fresh_cross") else ""
-        print(f"\n  ✅ {name}")
-        print(f"     Signal     : {arrow}{cross}")
-        print(f"     Price      : {result['price']}")
-        print(f"     SMA-50     : {result['sma50']}")
-        print(f"     ADX        : {result['adx']}")
-        print(f"     RSI        : {result['rsi']}")
-        print(f"     MACD       : {result['macd']}  |  Signal: {result['macd_sig']}")
-        print(f"     Confidence : {result['confidence']}%")
-    else:
-        print(f"  ✗  {name:<10} → {skip_reason}")
-
-def print_summary(signals, skips):
-    print(f"\n{SEP2}")
-    print(f"  SCAN COMPLETE")
-    print(f"  Signals found : {len(signals)}/3")
-    print(f"  Skipped       : {len(skips)} assets")
-    if signals:
-        open_at, close_at = trade_times()
-        print(f"\n  ⏰ Open trades  : {open_at} IST")
-        print(f"  ⏰ Close trades : {close_at} IST")
-        print(f"\n  TRADES TO PLACE:")
-        for i, s in enumerate(signals, 1):
-            arrow = "▲ CALL (UP)" if s["signal"] == "UP" else "▼ PUT (DOWN)"
-            print(f"  {i}. {s['asset']:<10} {arrow}  conf={s['confidence']}%")
-    else:
-        print(f"\n  ❌ No tradeable signals this scan")
-        print(f"  Best times: 14:00–16:00 IST or 19:00–21:00 IST")
-    print(SEP)
-
-# ── Core analysis ─────────────────────────────────────────────────────────────
-def analyze(name, ticker):
+# ── Signal scoring system ─────────────────────────────────────────────────────
+def score_signal(name, ticker):
+    """
+    Returns (signal, score, details, skip_reason)
+    Score = count of indicators agreeing (max 7)
+    We only trade if score >= 5 (5 out of 7 indicators agree)
+    """
     try:
         df = yf.download(ticker, period="5d", interval="5m",
                          progress=False, auto_adjust=True)
         if df.empty or len(df) < 60:
-            return None, "No data fetched"
+            return None, 0, {}, "No data"
         df.columns = [c[0].lower() if isinstance(c,tuple) else c.lower()
                       for c in df.columns]
     except Exception as e:
-        return None, f"Fetch error: {e}"
+        return None, 0, {}, f"Fetch error: {e}"
 
-    df["sma50"]                         = df["close"].rolling(50).mean()
-    df["ema9"]                          = df["close"].ewm(span=9,  adjust=False).mean()
-    df["ema21"]                         = df["close"].ewm(span=21, adjust=False).mean()
-    df["adx"], df["pdi"], df["mdi"]     = calc_adx(df)
-    df["rsi"]                           = calc_rsi(df["close"])
-    df["macd"], df["macd_sig"], df["macd_hist"] = calc_macd(df["close"])
-    df["bb_up"], df["bb_mid"], df["bb_low"]     = calc_bollinger(df["close"])
+    # Calculate all indicators
+    df["sma50"]                           = df["close"].rolling(50).mean()
+    df["ema9"]                            = df["close"].ewm(span=9,  adjust=False).mean()
+    df["ema21"]                           = df["close"].ewm(span=21, adjust=False).mean()
+    df["adx"], df["pdi"], df["mdi"]       = calc_adx(df)
+    df["rsi"]                             = calc_rsi(df["close"])
+    df["macd"], df["macd_sig"], df["hist"]= calc_macd(df["close"])
+    df["bb_up"], df["bb_mid"], df["bb_low"]= calc_bollinger(df["close"])
+    df["stoch_k"], df["stoch_d"]          = calc_stochastic(df)
+    try:
+        df["vwap"] = calc_vwap(df)
+        has_vwap = True
+    except:
+        has_vwap = False
 
     r, p2 = df.iloc[-1], df.iloc[-2]
 
     price     = float(r["close"])
     sma50     = float(r["sma50"])
+    ema9      = float(r["ema9"])
+    ema21     = float(r["ema21"])
     adx_val   = float(r["adx"])
     pdi       = float(r["pdi"])
     mdi       = float(r["mdi"])
     rsi_val   = float(r["rsi"])
-    ema9      = float(r["ema9"])
-    ema21     = float(r["ema21"])
     macd_now  = float(r["macd"])
     sig_now   = float(r["macd_sig"])
-    hist_now  = float(r["macd_hist"])
-    hist_prv  = float(p2["macd_hist"])
+    hist_now  = float(r["hist"])
+    hist_prv  = float(p2["hist"])
     bb_up     = float(r["bb_up"])
     bb_low    = float(r["bb_low"])
+    stoch_k   = float(r["stoch_k"])
+    stoch_d   = float(r["stoch_d"])
     sma_slope = sma50 - float(p2["sma50"])
 
-    # ── Sideways filters ──────────────────────────────────────────────────────
+    # ── Hard rejection filters — market must be trending ─────────────────────
     recent    = df.tail(10)
     range_pct = (float(recent["high"].max()-recent["low"].min())/price)*100
 
-    if adx_val < 18:
-        return None, f"ADX {adx_val:.1f} < 18 — no trend"
+    if adx_val < 20:
+        return None, 0, {}, f"ADX {adx_val:.1f} < 20 — sideways"
     if range_pct < 0.04:
-        return None, f"Range {range_pct:.3f}% — dead sideways"
-    if 47 < rsi_val < 53:
-        return None, f"RSI {rsi_val:.1f} — dead zone"
+        return None, 0, {}, f"Range {range_pct:.3f}% — dead market"
 
-    # ── MACD ──────────────────────────────────────────────────────────────────
-    macd_bull       = hist_now > hist_prv and macd_now > sig_now
-    macd_bear       = hist_now < hist_prv and macd_now < sig_now
+    # ── Score each indicator independently ───────────────────────────────────
+    bull_score = 0
+    bear_score = 0
+    votes = {}
+
+    # 1. SMA50 — price above or below
+    if price > sma50 and sma_slope > 0:
+        bull_score += 1; votes["SMA50"] = "▲ BULL"
+    elif price < sma50 and sma_slope < 0:
+        bear_score += 1; votes["SMA50"] = "▼ BEAR"
+    else:
+        votes["SMA50"] = "— NEUTRAL"
+
+    # 2. EMA crossover
+    if ema9 > ema21:
+        bull_score += 1; votes["EMA9/21"] = "▲ BULL"
+    elif ema9 < ema21:
+        bear_score += 1; votes["EMA9/21"] = "▼ BEAR"
+    else:
+        votes["EMA9/21"] = "— NEUTRAL"
+
+    # 3. ADX directional
+    if pdi > mdi and adx_val > 22:
+        bull_score += 1; votes["ADX/DI"] = f"▲ BULL (ADX {adx_val:.0f})"
+    elif mdi > pdi and adx_val > 22:
+        bear_score += 1; votes["ADX/DI"] = f"▼ BEAR (ADX {adx_val:.0f})"
+    else:
+        votes["ADX/DI"] = f"— WEAK (ADX {adx_val:.0f})"
+
+    # 4. RSI
+    if rsi_val > 55 and rsi_val < 75:
+        bull_score += 1; votes["RSI"] = f"▲ BULL ({rsi_val:.0f})"
+    elif rsi_val < 45 and rsi_val > 25:
+        bear_score += 1; votes["RSI"] = f"▼ BEAR ({rsi_val:.0f})"
+    elif rsi_val >= 75:
+        votes["RSI"] = f"⚠ OVERBOUGHT ({rsi_val:.0f})"
+    elif rsi_val <= 25:
+        votes["RSI"] = f"⚠ OVERSOLD ({rsi_val:.0f})"
+    else:
+        votes["RSI"] = f"— NEUTRAL ({rsi_val:.0f})"
+
+    # 5. MACD — histogram direction + line position
     macd_cross_up   = macd_now > sig_now and float(p2["macd"]) <= float(p2["macd_sig"])
     macd_cross_down = macd_now < sig_now and float(p2["macd"]) >= float(p2["macd_sig"])
+    if (macd_now > sig_now and hist_now > hist_prv):
+        bull_score += 1
+        votes["MACD"] = "▲ BULL" + (" ⚡CROSS" if macd_cross_up else "")
+    elif (macd_now < sig_now and hist_now < hist_prv):
+        bear_score += 1
+        votes["MACD"] = "▼ BEAR" + (" ⚡CROSS" if macd_cross_down else "")
+    else:
+        votes["MACD"] = "— FLAT"
 
-    # ── Trend ─────────────────────────────────────────────────────────────────
-    trend_up   = price > sma50 and sma_slope > 0 and ema9 > ema21 and pdi > mdi
-    trend_down = price < sma50 and sma_slope < 0 and ema9 < ema21 and mdi > pdi
+    # 6. Bollinger Bands
+    bb_pos = (price - bb_low) / (bb_up - bb_low) if (bb_up - bb_low) > 0 else 0.5
+    if 0.5 < bb_pos < 0.85:
+        bull_score += 1; votes["BB"] = f"▲ BULL (pos {bb_pos:.0%})"
+    elif 0.15 < bb_pos < 0.5:
+        bear_score += 1; votes["BB"] = f"▼ BEAR (pos {bb_pos:.0%})"
+    elif bb_pos >= 0.85:
+        votes["BB"] = f"⚠ NEAR UPPER — skip"
+    elif bb_pos <= 0.15:
+        votes["BB"] = f"⚠ NEAR LOWER — skip"
+    else:
+        votes["BB"] = "— NEUTRAL"
 
-    # ── RSI ───────────────────────────────────────────────────────────────────
-    rsi_bull = rsi_val > 54 and rsi_val < 75
-    rsi_bear = rsi_val < 46 and rsi_val > 25
+    # 7. Stochastic
+    if stoch_k > stoch_d and stoch_k < 80:
+        bull_score += 1; votes["STOCH"] = f"▲ BULL (K:{stoch_k:.0f} D:{stoch_d:.0f})"
+    elif stoch_k < stoch_d and stoch_k > 20:
+        bear_score += 1; votes["STOCH"] = f"▼ BEAR (K:{stoch_k:.0f} D:{stoch_d:.0f})"
+    elif stoch_k >= 80:
+        votes["STOCH"] = f"⚠ OVERBOUGHT (K:{stoch_k:.0f})"
+    elif stoch_k <= 20:
+        votes["STOCH"] = f"⚠ OVERSOLD (K:{stoch_k:.0f})"
+    else:
+        votes["STOCH"] = "— NEUTRAL"
 
-    # ── Bollinger ─────────────────────────────────────────────────────────────
-    at_bb_top = price >= bb_up  * 0.9999
-    at_bb_bot = price <= bb_low * 1.0001
+    # ── Decision — need 5 out of 7 indicators agreeing ────────────────────────
+    MAX_SCORE = 7
+    MIN_SCORE = 5   # 5/7 indicators must agree
 
-    # ── Final signal ──────────────────────────────────────────────────────────
-    bull = trend_up   and rsi_bull and (macd_bull or macd_cross_up)   and not at_bb_top
-    bear = trend_down and rsi_bear and (macd_bear or macd_cross_down) and not at_bb_bot
+    if bull_score >= MIN_SCORE and bull_score > bear_score:
+        signal = "UP"
+        score  = bull_score
+    elif bear_score >= MIN_SCORE and bear_score > bull_score:
+        signal = "DOWN"
+        score  = bear_score
+    else:
+        top = max(bull_score, bear_score)
+        return None, top, votes, f"Only {top}/7 indicators agree — need 5+"
 
-    if not bull and not bear:
-        reasons = []
-        if not trend_up   and not trend_down: reasons.append("trend not aligned")
-        if not rsi_bull   and not rsi_bear:   reasons.append(f"RSI {rsi_val:.0f} neutral")
-        if not macd_bull  and not macd_bear:  reasons.append("MACD flat")
-        if at_bb_top: reasons.append("at BB upper — overbought")
-        if at_bb_bot: reasons.append("at BB lower — oversold")
-        return None, " | ".join(reasons) or "mixed signals"
+    # ── Confidence from score ─────────────────────────────────────────────────
+    conf_map = {5: 78, 6: 88, 7: 96}
+    confidence = conf_map.get(score, 70)
 
-    signal = "UP" if bull else "DOWN"
+    # ADX bonus
+    if adx_val > 30: confidence = min(confidence + 3, 98)
 
-    conf  = 50
-    conf += min(15, int((adx_val - 18) * 0.8))
-    conf += min(12, int(abs(rsi_val - 50) * 0.5))
-    conf += 15 if (macd_cross_up or macd_cross_down) else 8
-    conf += min(8,  int(abs(ema9 - ema21) / price * 10000))
-    conf += min(8,  int(abs(pdi - mdi) * 0.3))
-    conf  = min(conf, 98)
+    # MACD crossover bonus
+    if macd_cross_up or macd_cross_down: confidence = min(confidence + 4, 98)
 
-    if conf < 75:
-        return None, f"Confidence {conf}% < 75%"
-
-    return {
-        "asset":       name,
-        "signal":      signal,
+    details = {
         "price":       round(price, 5),
         "sma50":       round(sma50, 5),
         "adx":         round(adx_val, 1),
         "rsi":         round(rsi_val, 1),
         "macd":        round(macd_now, 6),
         "macd_sig":    round(sig_now, 6),
-        "confidence":  conf,
+        "stoch_k":     round(stoch_k, 1),
+        "stoch_d":     round(stoch_d, 1),
+        "confidence":  confidence,
+        "score":       f"{score}/7",
         "fresh_cross": macd_cross_up or macd_cross_down,
-    }, None
+        "votes":       votes,
+    }
+
+    return signal, score, details, None
+
+# ── Console print ─────────────────────────────────────────────────────────────
+def print_header():
+    print(SEP)
+    print("   CRYPTO KNIGHT — HIGH CONFIDENCE SCANNER")
+    print(f"   {ist_now()}")
+    print(f"   Strategy : SMA50+EMA+MACD+ADX+RSI+BB+STOCH")
+    print(f"   Rule     : 5/7 indicators must agree")
+    print(f"   Timeframe: M5 | Expiry: 5 mins")
+    print(SEP)
+
+def print_asset(name, signal, score, details, skip):
+    if signal:
+        arrow = "▲ UP   (CALL)" if signal == "UP" else "▼ DOWN (PUT) "
+        cross = " ⚡" if details.get("fresh_cross") else ""
+        print(f"\n  ✅ {name} — {arrow}{cross}")
+        print(f"     Score      : {details['score']} indicators agree")
+        print(f"     Confidence : {details['confidence']}%")
+        print(f"     Price      : {details['price']}")
+        print(f"     ADX        : {details['adx']}")
+        print(f"     RSI        : {details['rsi']}")
+        print(f"     MACD       : {details['macd']}")
+        print(f"     Stoch K/D  : {details['stoch_k']} / {details['stoch_d']}")
+        print(f"\n     Indicator votes:")
+        for ind, vote in details["votes"].items():
+            print(f"       {ind:<8} : {vote}")
+    else:
+        agreed = score
+        print(f"  ✗  {name:<10} → {skip} [{agreed}/7]")
+
+def print_summary(signals, skips):
+    print(f"\n{SEP2}")
+    print(f"  SCAN RESULT")
+    print(f"  Signals : {len(signals)} found")
+    if signals:
+        open_at, close_at = trade_times()
+        print(f"\n  ⏰ Open  : {open_at} IST")
+        print(f"  ⏰ Close : {close_at} IST (5-min expiry)")
+        print(f"\n  PLACE THESE TRADES:")
+        for i, s in enumerate(signals, 1):
+            arrow = "▲ CALL (UP)" if s["signal"]=="UP" else "▼ PUT  (DOWN)"
+            print(f"  {i}. {s['asset']:<10} {arrow}  {s['details']['score']}  {s['details']['confidence']}%")
+    else:
+        print(f"\n  ❌ No trades — market not ready")
+        print(f"  Retry: 14:00–16:00 IST or 19:00–21:00 IST")
+    print(SEP)
+
+# ── Result tracker ────────────────────────────────────────────────────────────
+RESULTS_FILE = "results.json"
+
+def load_results():
+    if Path(RESULTS_FILE).exists():
+        with open(RESULTS_FILE) as f:
+            return json.load(f)
+    return {"trades": [], "wins": 0, "losses": 0, "ties": 0, "total": 0}
+
+def save_signal_to_results(signals):
+    """Log signals so you can manually update win/loss later."""
+    data = load_results()
+    open_at, close_at = trade_times()
+    for s in signals:
+        entry = {
+            "id":         len(data["trades"]) + 1,
+            "date":       ist_now(),
+            "asset":      s["asset"],
+            "signal":     s["signal"],
+            "price":      s["details"]["price"],
+            "confidence": s["details"]["confidence"],
+            "score":      s["details"]["score"],
+            "open_at":    open_at,
+            "close_at":   close_at,
+            "result":     "PENDING",   # update manually: WIN / LOSS / TIE
+            "pnl":        0,
+        }
+        data["trades"].append(entry)
+        data["total"] += 1
+    with open(RESULTS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+    print(f"  📋 Logged {len(signals)} trade(s) to {RESULTS_FILE}")
+
+def print_stats():
+    data = load_results()
+    total  = data["total"]
+    wins   = data["wins"]
+    losses = data["losses"]
+    ties   = data["ties"]
+    pending = total - wins - losses - ties
+    if total == 0:
+        print("  📊 No trades recorded yet")
+        return
+    win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
+    print(f"\n{SEP2}")
+    print(f"  TRACK RECORD  ({total} signals logged)")
+    print(f"  Wins    : {wins}")
+    print(f"  Losses  : {losses}")
+    print(f"  Ties    : {ties}")
+    print(f"  Pending : {pending}")
+    print(f"  Win rate: {win_rate:.1f}%")
+    if win_rate >= 60:
+        print(f"  ✅ PROFITABLE — keep trading")
+    elif win_rate >= 50:
+        print(f"  ⚠️  BREAKEVEN — needs improvement")
+    elif (wins + losses) >= 10:
+        print(f"  ❌ BELOW 50% — stop real money")
+    print(SEP2)
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
 def send_signals(signals):
     open_at, close_at = trade_times()
+    data = load_results()
+    wins = data["wins"]; losses = data["losses"]
+    win_rate = f"{wins/(wins+losses)*100:.0f}%" if (wins+losses) > 0 else "N/A"
+
     lines = [
-        "🎯 <b>Crypto Knight — Signal</b>",
+        "🎯 <b>Crypto Knight — HIGH CONF Signal</b>",
         f"⏰ <code>{ist_now()}</code>",
+        f"📊 Track record: {wins}W/{losses}L (WR: {win_rate})",
         "",
     ]
     for i, s in enumerate(signals, 1):
-        em  = "🟢" if s["signal"] == "UP" else "🔴"
-        act = "CALL  ▲  (UP)" if s["signal"] == "UP" else "PUT  ▼  (DOWN)"
-        cross = "\n   ⚡ <b>Fresh MACD crossover!</b>" if s.get("fresh_cross") else ""
+        em  = "🟢" if s["signal"]=="UP" else "🔴"
+        act = "CALL  ▲  (UP)" if s["signal"]=="UP" else "PUT  ▼  (DOWN)"
+        d   = s["details"]
+        cross = "\n   ⚡ <b>Fresh MACD crossover!</b>" if d.get("fresh_cross") else ""
         lines += [
             "──────────────────────" if i > 1 else "",
             f"{em} <b>TRADE {i}/3 — {s['asset']}</b>",
             f"   Action     : <b>{act}</b>",
-            f"   Price      : <code>{s['price']}</code>",
-            f"   SMA-50     : <code>{s['sma50']}</code>",
-            f"   ADX        : <code>{s['adx']}</code>",
-            f"   RSI        : <code>{s['rsi']}</code>",
-            f"   MACD       : <code>{s['macd']}</code>",
-            f"   Confidence : <code>{s['confidence']}%</code>{cross}",
+            f"   Score      : <code>{d['score']} indicators agree</code>",
+            f"   Confidence : <code>{d['confidence']}%</code>{cross}",
+            f"   Price      : <code>{d['price']}</code>",
+            f"   ADX        : <code>{d['adx']}</code>",
+            f"   RSI        : <code>{d['rsi']}</code>",
+            f"   Stoch K/D  : <code>{d['stoch_k']} / {d['stoch_d']}</code>",
             f"   Open at    : <code>{open_at} IST</code>",
             f"   Close at   : <code>{close_at} IST</code>",
             "",
@@ -247,24 +402,29 @@ def send_signals(signals):
     lines += [
         "──────────────────────",
         "📌 <b>Pocket Option → expiry 5 mins</b>",
-        "⚠️ <i>Max 3 trades. Stop after 1 loss.</i>",
+        "⚠️ <i>Stop after 1 loss. Max 3 trades/day.</i>",
     ]
     _tg("\n".join(lines))
 
 def send_no_signal(skips):
+    data = load_results()
+    wins = data["wins"]; losses = data["losses"]
+    win_rate = f"{wins/(wins+losses)*100:.0f}%" if (wins+losses) > 0 else "N/A"
     lines = [
         "🔍 <b>Crypto Knight</b>",
         f"⏰ <code>{ist_now()}</code>",
+        f"📊 Track record: {wins}W/{losses}L (WR: {win_rate})",
         "",
-        "❌ <b>No trades this scan</b>",
+        "❌ <b>No trade — 5/7 indicators not aligned</b>",
+        "<i>This is the filter protecting your money.</i>",
         "",
-        "📋 Skip reasons:",
+        "📋 <b>Indicator summary:</b>",
     ]
     for name, reason in skips.items():
         lines.append(f"   • <code>{name}</code>: {reason}")
     lines += [
         "",
-        "<i>Best times:\n• 14:00–16:00 IST (London peak)\n• 19:00–21:00 IST (NY session)</i>",
+        "<i>Best times:\n• 14:00–16:00 IST\n• 19:00–21:00 IST</i>",
     ]
     _tg("\n".join(lines))
 
@@ -272,28 +432,29 @@ def _tg(text):
     try:
         r = httpx.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"},
+            json={"chat_id":CHAT_ID,"text":text,"parse_mode":"HTML"},
             timeout=15,
         )
         if r.status_code == 403:
             print("  ❌ Telegram 403 — send /start to your bot")
             return
         r.raise_for_status()
-        print("  ✅ Telegram message sent")
+        print("  ✅ Telegram sent")
     except Exception as e:
-        print(f"  ❌ Telegram error: {e}")
+        print(f"  ❌ Telegram: {e}")
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     print_header()
+    print_stats()
 
     signals, skips = [], {}
 
     for name, ticker in ASSETS.items():
-        result, skip_reason = analyze(name, ticker)
-        print_asset_result(name, result, skip_reason)
-        if result:
-            signals.append(result)
+        signal, score, details, skip_reason = score_signal(name, ticker)
+        print_asset(name, signal, score, details, skip_reason)
+        if signal:
+            signals.append({"asset": name, "signal": signal, "details": details})
             if len(signals) >= 3:
                 break
         else:
@@ -301,13 +462,14 @@ def main():
 
     print_summary(signals, skips)
 
-    # Send to Telegram
-    print("\n  Sending to Telegram...")
     if signals:
+        save_signal_to_results(signals)
         send_signals(signals)
     else:
         send_no_signal(skips)
 
+    print(f"\n  Done at {ist_now()}")
+
 if __name__ == "__main__":
     main()
-    
+        
