@@ -223,7 +223,7 @@ def score_signal(name, ticker):
 
     # ── Decision — need 5 out of 7 indicators agreeing ────────────────────────
     MAX_SCORE = 7
-    MIN_SCORE = 5   # 5/7 indicators must agree
+    MIN_SCORE = 6   # 6/7 indicators must agree — high confidence only
 
     if bull_score >= MIN_SCORE and bull_score > bear_score:
         signal = "UP"
@@ -233,7 +233,7 @@ def score_signal(name, ticker):
         score  = bear_score
     else:
         top = max(bull_score, bear_score)
-        return None, top, votes, f"Only {top}/7 indicators agree — need 5+"
+        return None, top, votes, f"Only {top}/7 indicators agree — need 6+"
 
     # ── Confidence from score ─────────────────────────────────────────────────
     conf_map = {5: 78, 6: 88, 7: 96}
@@ -294,12 +294,12 @@ def print_asset(name, signal, score, details, skip):
 def print_summary(signals, skips):
     print(f"\n{SEP2}")
     print(f"  SCAN RESULT")
-    print(f"  Signals : {len(signals)} found")
+    print(f"  Signal  : {len(signals)} found (max 1)")
     if signals:
         open_at, close_at = trade_times()
         print(f"\n  ⏰ Open  : {open_at} IST")
         print(f"  ⏰ Close : {close_at} IST (5-min expiry)")
-        print(f"\n  PLACE THESE TRADES:")
+        print(f"\n  PLACE THIS TRADE:")
         for i, s in enumerate(signals, 1):
             arrow = "▲ CALL (UP)" if s["signal"]=="UP" else "▼ PUT  (DOWN)"
             print(f"  {i}. {s['asset']:<10} {arrow}  {s['details']['score']}  {s['details']['confidence']}%")
@@ -375,7 +375,8 @@ def send_signals(signals):
     win_rate = f"{wins/(wins+losses)*100:.0f}%" if (wins+losses) > 0 else "N/A"
 
     lines = [
-        "🎯 <b>Crypto Knight — HIGH CONF Signal</b>",
+        "🎯 <b>Crypto Knight — STRONGEST SIGNAL</b>",
+        f"🏆 <b>Best of all 6 pairs scanned</b>",
         f"⏰ <code>{ist_now()}</code>",
         f"📊 Track record: {wins}W/{losses}L (WR: {win_rate})",
         "",
@@ -387,8 +388,9 @@ def send_signals(signals):
         cross = "\n   ⚡ <b>Fresh MACD crossover!</b>" if d.get("fresh_cross") else ""
         lines += [
             "──────────────────────" if i > 1 else "",
-            f"{em} <b>TRADE {i}/3 — {s['asset']}</b>",
+            f"{em} <b>{s['asset']} — {act}</b>",
             f"   Action     : <b>{act}</b>",
+        f"   Score      : <code>{d['score']} indicators agree</code>",
             f"   Score      : <code>{d['score']} indicators agree</code>",
             f"   Confidence : <code>{d['confidence']}%</code>{cross}",
             f"   Price      : <code>{d['price']}</code>",
@@ -402,7 +404,7 @@ def send_signals(signals):
     lines += [
         "──────────────────────",
         "📌 <b>Pocket Option → expiry 5 mins</b>",
-        "⚠️ <i>Stop after 1 loss. Max 3 trades/day.</i>",
+        "⚠️ <i>1 trade only. If it loses, stop for today.</i>",
     ]
     _tg("\n".join(lines))
 
@@ -450,15 +452,33 @@ def main():
 
     signals, skips = [], {}
 
+    all_signals = []
+
     for name, ticker in ASSETS.items():
         signal, score, details, skip_reason = score_signal(name, ticker)
         print_asset(name, signal, score, details, skip_reason)
         if signal:
-            signals.append({"asset": name, "signal": signal, "details": details})
-            if len(signals) >= 3:
-                break
+            all_signals.append({
+                "asset":   name,
+                "signal":  signal,
+                "details": details,
+                "score":   score,
+            })
         else:
             skips[name] = skip_reason
+
+    # Pick the single strongest signal across all assets
+    if all_signals:
+        # Sort by score first, then confidence
+        best = sorted(
+            all_signals,
+            key=lambda x: (x["score"], x["details"]["confidence"]),
+            reverse=True
+        )[0]
+        signals = [best]
+        print(f"\n  🏆 BEST SIGNAL: {best['asset']} {best['signal']}")
+        print(f"     Score: {best['score']}/7  Conf: {best['details']['confidence']}%")
+        print(f"     (Scanned all {len(all_signals)} candidate(s), picked strongest)")
 
     print_summary(signals, skips)
 
@@ -472,4 +492,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-        
+    
