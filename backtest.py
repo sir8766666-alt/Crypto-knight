@@ -8,6 +8,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -133,9 +134,9 @@ def get_signal(df, i):
 
 # ── Backtest one asset ────────────────────────────────────────────────────────
 def backtest_asset(name, ticker):
-    print(f"\n  Downloading {name} — 60 days M5...")
+    print(f"\n  Downloading {name} — 15 days M5...")
     try:
-        df = yf.download(ticker, period="60d", interval="5m",
+        df = yf.download(ticker, period="15d", interval="5m",
                          progress=False, auto_adjust=True)
         if df.empty or len(df) < 100:
             print(f"  No data for {name}")
@@ -239,17 +240,25 @@ def analyze_results(name, trades):
 def main():
     print(SEP)
     print("  CRYPTO KNIGHT — BACKTESTER")
-    print("  60 days M5 historical data")
+    print("  15 days M5 historical data")
     print("  Same strategy as live scanner")
     print("  6/7 indicators required")
     print(SEP)
 
     all_results = []
 
-    for name, ticker in ASSETS.items():
+    # Download all 6 assets in parallel — much faster
+    def run_asset(args):
+        name, ticker = args
         trades = backtest_asset(name, ticker)
         if trades:
-            res = analyze_results(name, trades)
+            return analyze_results(name, trades)
+        return None
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = {executor.submit(run_asset, (n, t)): n for n, t in ASSETS.items()}
+        for future in as_completed(futures):
+            res = future.result()
             if res:
                 all_results.append(res)
 
