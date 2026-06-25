@@ -125,8 +125,7 @@ def print_stats():
         print("  📊 No trades recorded yet")
         return
     win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
-    print(f"
-{SEP2}")
+    print(f"{SEP2}")
     print(f"  TRACK RECORD  ({total} signals logged)")
     print(f"  Wins    : {wins}")
     print(f"  Losses  : {losses}")
