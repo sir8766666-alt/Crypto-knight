@@ -328,7 +328,7 @@ def print_asset(name, signal, score, details, skip):
     if signal:
         arrow = "▲ UP   (CALL)" if signal == "UP" else "▼ DOWN (PUT)"
         cross = " ⚡" if details.get("fresh_cross") else ""
-        print(f" ✅ {name} — {arrow}{cross}")
+        print(f"     ✅ {name} — {arrow}{cross}")
         print(f"     Score      : {details['score']} indicators agree")
         print(f"     Confidence : {details['confidence']}%")
         print(f"     Price      : {details['price']}")
