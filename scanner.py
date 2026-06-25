@@ -328,8 +328,7 @@ def print_asset(name, signal, score, details, skip):
     if signal:
         arrow = "▲ UP   (CALL)" if signal == "UP" else "▼ DOWN (PUT)"
         cross = " ⚡" if details.get("fresh_cross") else ""
-        print(f"
-  ✅ {name} — {arrow}{cross}")
+        print(f" ✅ {name} — {arrow}{cross}")
         print(f"     Score      : {details['score']} indicators agree")
         print(f"     Confidence : {details['confidence']}%")
         print(f"     Price      : {details['price']}")
@@ -345,8 +344,7 @@ def print_asset(name, signal, score, details, skip):
         print(f"  ✗  {name:<10} → {skip} [{score}/7]")
 
 def print_summary(signals, skips):
-    print(f"
-{SEP2}")
+    print(f"{SEP2}")
     print("  SCAN RESULT")
     print(f"  Signal  : {len(signals)} found (max 1)")
     if signals:
@@ -354,14 +352,12 @@ def print_summary(signals, skips):
         print(f"
   ⏰ Open  : {open_at} IST")
         print(f"  ⏰ Close : {close_at} IST (5-min expiry)")
-        print("
-  PLACE THIS TRADE:")
+        print(" PLACE THIS TRADE:")
         for i, s in enumerate(signals, 1):
             arrow = "▲ CALL (UP)" if s["signal"] == "UP" else "▼ PUT  (DOWN)"
             print(f"  {i}. {s['asset']:<10} {arrow}  {s['details']['score']}  {s['details']['confidence']}%")
     else:
-        print("
-  ❌ No trades — market not ready")
+        print("❌ No trades — market not ready")
         print("  Retry: 14:00–16:00 IST or 19:00–21:00 IST")
     print(SEP)
 
